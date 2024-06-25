@@ -29,6 +29,7 @@ trait FsTraits: Send {
     fn path_exists(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> Result<bool, String>;
     fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
+    fn remove_file(&self, path: &str) -> std::io::Result<()>;
 }
 
 #[derive(Clone)]
@@ -105,6 +106,10 @@ impl FsTraits for FsImpl {
     fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
         fs::create_dir_all(path)
     }
+
+    fn remove_file(&self, path: &str) -> std::io::Result<()> {
+        fs::remove_file(path)
+    }
 }
 
 struct Settings {
@@ -157,30 +162,45 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
 
     let (stop_pid_thread_tx, stop_pid_thread_rx) = mpsc::channel();
 
-    let handle = move |path: String| {
+    let pid_thread = move |path: String| {
         fsimpl_pid_thread
             .write(&path, &format!("{}", std::process::id()))
             .unwrap();
-        thread::sleep(Duration::from_secs(60));
-        let received = stop_pid_thread_rx.try_recv();
-        match received {
-            Ok(_) => return,
-            Err(_) => (),
+        for _ in 1..600 {
+            thread::sleep(Duration::from_millis(100));
+            let received = stop_pid_thread_rx.try_recv();
+            match received {
+                Ok(_) => return,
+                Err(_) => (),
+            }
         }
     };
 
-    thread::spawn(move || handle(pid_path.clone()));
+    let pid_thread_pid_path = pid_path.clone();
+    let pid_handle = thread::spawn(move || pid_thread(pid_thread_pid_path));
 
-    // rsync each configured place to dest/.sync/ - abort if any are missing
-    let sources = match settings.config.get("sources") {
-        Some(main) => main,
-        None => return Err(String::from("No sources section in config")),
-    };
+    let result = do_work(settings, &context);
 
+    // del pid file
+    let _ = stop_pid_thread_tx.send("done");
+    let _ = pid_handle.join();
+
+    match context.fsimpl.remove_file(&pid_path) {
+        Ok(()) => (),
+        Err(error) => {
+            return Err(format!(
+                "Main result: {:?} Could not remove PID file {:?}: {:?}",
+                result, pid_path, error
+            ))
+        }
+    }
+
+    result
+}
+
+fn do_work(settings: Settings, context: &Context) -> Result<(), String> {
     let target_root = get_conf_key(&settings.config, "main", "target_root")?;
-
     let target_path = Path::new(&target_root);
-
     if context.fsimpl.path_exists(&target_path) {
         if !context.fsimpl.is_dir(&target_path)? {
             return Err(format!("{} is not a directory", target_root));
@@ -200,7 +220,10 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
             return Err(format!("Target root {:?} does not exist", target_root));
         }
     }
-
+    let sources = match settings.config.get("sources") {
+        Some(main) => main,
+        None => return Err(String::from("No sources section in config")),
+    };
     for (source, dest) in sources {
         match dest {
             Some(_) => (),
@@ -223,22 +246,22 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
             }
         }
     }
-
-    let _ = stop_pid_thread_tx.send("done");
-
-    // loop through each period
-    //   if shortest period
-    //     if most recent is old enough then
-    //       rm period.oldest if too many
-    //       mv period.n-1 period.n if period.n-1 exists
-    //       cp -al .sync period.0
-    //   else
-    //     if most_recent(this period) - oldest(shorter period) >= interval
-    //       rm period.oldest if too many
-    //       mv period.n-1 period.n if period.n-1 exists
-    //       mv oldest(shorter period) period.0
-    // del pid file
-
+    let periods = match settings.config.get("periods") {
+        Some(main) => main,
+        None => return Err(String::from("No periods section in config")),
+    };
+    for (period, details) in periods {
+        //   if shortest period
+        //     if most recent is old enough then
+        //       rm period.oldest if too many
+        //       mv period.n-1 period.n if period.n-1 exists
+        //       cp -al .sync period.0
+        //   else
+        //     if most_recent(this period) - oldest(shorter period) >= interval
+        //       rm period.oldest if too many
+        //       mv period.n-1 period.n if period.n-1 exists
+        //       mv oldest(shorter period) period.0
+    }
     Ok(())
 }
 
@@ -336,6 +359,7 @@ mod tests {
             fn path_exists(&self, path: &Path) -> bool;
             fn is_dir(&self, path: &Path) -> Result<bool, String>;
             fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
+            fn remove_file(&self, path: &str) -> std::io::Result<()>;
         }
         impl Clone for FsImpl {
             fn clone(&self) -> Self;
