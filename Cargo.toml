@@ -1,0 +1,10 @@
+[package]
+name = "safersync"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.7", features = ["derive"] }
+configparser = "3.1.0"
+filetime = "0.2.23"
+mockall = "0.12.1"
