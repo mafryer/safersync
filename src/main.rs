@@ -1,5 +1,7 @@
 use clap::Parser;
 use configparser::ini::Ini;
+use duration_string::DurationString;
+use filenamify::filenamify;
 use filetime::FileTime;
 use std::collections::HashMap;
 use std::fs;
@@ -116,6 +118,12 @@ struct Settings {
     config: HashMap<std::string::String, HashMap<std::string::String, Option<std::string::String>>>,
 
     ignore_others: bool,
+}
+
+struct PeriodInfo {
+    name: String,
+    count: u32,
+    interval: Duration,
 }
 
 fn main() -> Result<(), String> {
@@ -250,7 +258,74 @@ fn do_work(settings: Settings, context: &Context) -> Result<(), String> {
         Some(main) => main,
         None => return Err(String::from("No periods section in config")),
     };
-    for (period, details) in periods {
+
+    let mut periods_vec = Vec::new();
+
+    for (period_name, details) in periods {
+        if period_name.len() == 0 {
+            return Err(String::from("An empty period name was found"));
+        }
+        if filenamify(&period_name).ne(period_name) {
+            return Err(format!("Invalid period name: {}", period_name));
+        }
+        /*
+        if periods_vec
+            .iter()
+            .any(|other: &PeriodInfo| other.name.eq(period_name))
+        {
+            return Err(format!("Duplicate period name: {}", period_name));
+        }
+        */
+        let details_str = details.clone().unwrap_or("".to_string());
+        let parts = details_str.split("@").collect::<Vec<&str>>();
+        if parts.len() != 2 {
+            return Err(format!(
+                "Invalid period details (should be <count>@<interval>) for {}: {}",
+                period_name, details_str
+            ));
+        }
+        let count = match parts[0].parse::<u32>() {
+            Ok(count) => count,
+            Err(_) => {
+                return Err(format!(
+                    "Could not parse count (should be 1-100) for {}: {}",
+                    period_name, details_str
+                ))
+            }
+        };
+        if count < 1 || count > 100 {
+            return Err(format!(
+                "Count should be 1-100 for {}: {}",
+                period_name, details_str
+            ));
+        }
+        let duration = DurationString::from_string(parts[1].to_string());
+        let interval: Duration = match duration {
+            Ok(duration) => duration.into(),
+            Err(_) => {
+                return Err(format!(
+                    "Could not parse interval (should be 1s-1y) for {}: {}",
+                    period_name, details_str
+                ))
+            }
+        };
+        if interval < Duration::from_secs(60 * 60)
+            || interval > Duration::from_secs(60 * 60 * 24 * 365 * 5)
+        {
+            return Err(format!(
+                "Interval should be 1h-5y for {}: {}",
+                period_name, details_str
+            ));
+        }
+
+        periods_vec.push(PeriodInfo {
+            name: period_name.clone(),
+            count: count,
+            interval: interval,
+        });
+    }
+
+    for period in periods_vec {
         //   if shortest period
         //     if most recent is old enough then
         //       rm period.oldest if too many
@@ -371,7 +446,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -391,6 +466,7 @@ mod tests {
         });
         mock.expect_path_exists().return_once(|_| true);
         mock.expect_is_dir().return_once(|_| Ok(true));
+        mock.expect_remove_file().return_once(|_| Ok(()));
 
         let result = body(mock, settings).unwrap();
         assert_eq!(result, ());
@@ -416,6 +492,7 @@ mod tests {
                 "Connection Reset",
             ))
         });
+
         let error = body(mock, settings).map_err(|e| e);
         assert_eq!(
             error,
@@ -430,7 +507,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -450,6 +527,8 @@ mod tests {
         });
         mock.expect_path_exists().return_once(|_| true);
         mock.expect_is_dir().return_once(|_| Ok(true));
+        mock.expect_remove_file().return_once(|_| Ok(()));
+
         let result = body(mock, settings).unwrap();
         assert_eq!(result, ());
     }
@@ -475,6 +554,7 @@ mod tests {
                 std::time::SystemTime::now().sub(std::time::Duration::from_secs(290)),
             ))
         });
+
         let error = body(mock, settings).map_err(|e| e);
         assert_eq!(error, Err(String::from("Already running with PID: \"1\"")));
     }
@@ -484,7 +564,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -505,6 +585,8 @@ mod tests {
         });
         mock.expect_path_exists().return_once(|_| true);
         mock.expect_is_dir().return_once(|_| Ok(true));
+        mock.expect_remove_file().return_once(|_| Ok(()));
+
         let result = body(mock, settings).unwrap();
         assert_eq!(result, ());
     }
@@ -534,6 +616,8 @@ mod tests {
         });
         mock.expect_path_exists().return_once(|_| true);
         mock.expect_is_dir().return_once(|_| Ok(true));
+        mock.expect_remove_file().return_once(|_| Ok(()));
+
         let error = body(mock, settings).map_err(|e| e);
         assert_eq!(error, Err(String::from("No destination for source \"/A\"")));
     }
@@ -543,7 +627,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n/A=/B\n/C=/D",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n/A=/B\n/C=/D\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -564,6 +648,8 @@ mod tests {
         mock.expect_path_exists().return_once(|_| true);
         mock.expect_is_dir().return_once(|_| Ok(true));
         mock.expect_rsync().times(2).returning(move |_, _| Ok(()));
+        mock.expect_remove_file().return_once(|_| Ok(()));
+
         let result = body(mock, settings).unwrap();
         assert_eq!(result, ());
     }
@@ -599,6 +685,8 @@ mod tests {
                 "rsync failed",
             ))
         });
+        mock.expect_remove_file().return_once(|_| Ok(()));
+
         let error = body(mock, settings).map_err(|e| e);
         assert_eq!(
             error,
@@ -606,6 +694,127 @@ mod tests {
                 "Could not rsync /A to {:?}: Custom {{ kind: Other, error: \"rsync failed\" }}",
                 Path::new("/B").join(".sync")
             ))
+        );
+    }
+
+    fn arrange_periods_test(periods: &str) -> (Settings, MockFsImpl) {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(format!(
+                "[main]
+                pid_file=/var/run/safersync.pid
+                target_root=
+                [sources]
+                /A=/B
+                /C=/D
+                [periods]
+                {}",
+                periods
+            )))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2.expect_write().return_once(move |_, _| Ok(()));
+        mock.expect_clone().return_once(move || mock2);
+        mock.expect_read_to_string().return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists().return_once(|_| true);
+        mock.expect_is_dir().return_once(|_| Ok(true));
+        mock.expect_rsync().times(2).returning(move |_, _| Ok(()));
+        mock.expect_remove_file().return_once(|_| Ok(()));
+
+        (settings, mock)
+    }
+
+    #[test]
+    fn if_invalid_period_name_then_error() {
+        let (settings, mock) = arrange_periods_test("/=1@1d");
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(error, Err(String::from("Invalid period name: /")));
+    }
+
+    #[test]
+    fn if_invalid_period_details_format_then_error() {
+        let (settings, mock) = arrange_periods_test("a=1");
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(String::from(
+                "Invalid period details (should be <count>@<interval>) for a: 1"
+            ))
+        );
+    }
+
+    #[test]
+    fn if_invalid_period_count_then_error() {
+        let (settings, mock) = arrange_periods_test("a=a@1h");
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(String::from(
+                "Could not parse count (should be 1-100) for a: a@1h"
+            ))
+        );
+    }
+
+    #[test]
+    fn if_period_count_too_few_then_error() {
+        let (settings, mock) = arrange_periods_test("a=0@1h");
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(String::from("Count should be 1-100 for a: 0@1h"))
+        );
+    }
+
+    #[test]
+    fn if_period_count_too_many_then_error() {
+        let (settings, mock) = arrange_periods_test("a=101@1h");
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(String::from("Count should be 1-100 for a: 101@1h"))
+        );
+    }
+
+    #[test]
+    fn if_invalid_period_length_then_error() {
+        let (settings, mock) = arrange_periods_test("a=1@xyz");
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(String::from(
+                "Could not parse interval (should be 1s-1y) for a: 1@xyz"
+            ))
+        );
+    }
+
+    #[test]
+    fn if_period_too_short_then_error() {
+        let (settings, mock) = arrange_periods_test("a=1@1s");
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(String::from("Interval should be 1h-5y for a: 1@1s"))
+        );
+    }
+
+    #[test]
+    fn if_period_too_long_then_error() {
+        let (settings, mock) = arrange_periods_test("a=1@5y1d");
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(String::from("Interval should be 1h-5y for a: 1@5y1d"))
         );
     }
 }
