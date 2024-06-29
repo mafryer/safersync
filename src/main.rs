@@ -3,6 +3,7 @@ use configparser::ini::Ini;
 use duration_string::DurationString;
 use filenamify::filenamify;
 use filetime::FileTime;
+use sorted_vec::SortedSet;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -24,14 +25,16 @@ struct Args {
 }
 
 trait FsTraits: Send {
-    fn read_to_string(&self, path: &str) -> std::io::Result<String>;
-    fn mtime(&self, path: &str) -> std::io::Result<FileTime>;
-    fn write(&self, path: &str, data: &str) -> std::io::Result<()>;
-    fn rsync(&self, source: &str, dest: &str) -> std::io::Result<()>;
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+    fn mtime(&self, path: &Path) -> std::io::Result<FileTime>;
+    fn write(&self, path: &Path, data: &str) -> std::io::Result<()>;
+    fn rsync(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
+    fn cp_al(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
+    fn mv(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
     fn path_exists(&self, path: &Path) -> bool;
     fn is_dir(&self, path: &Path) -> Result<bool, String>;
     fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
-    fn remove_file(&self, path: &str) -> std::io::Result<()>;
+    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
 }
 
 #[derive(Clone)]
@@ -40,11 +43,11 @@ struct FsImpl {}
 unsafe impl Send for FsImpl {}
 
 impl FsTraits for FsImpl {
-    fn read_to_string(&self, path: &str) -> std::io::Result<String> {
+    fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
         fs::read_to_string(path)
     }
 
-    fn mtime(&self, path: &str) -> std::io::Result<FileTime> {
+    fn mtime(&self, path: &Path) -> std::io::Result<FileTime> {
         let metadata = fs::metadata(path);
         match metadata {
             Ok(metadata) => Ok(FileTime::from_last_modification_time(&metadata)),
@@ -52,11 +55,11 @@ impl FsTraits for FsImpl {
         }
     }
 
-    fn write(&self, path: &str, data: &str) -> std::io::Result<()> {
+    fn write(&self, path: &Path, data: &str) -> std::io::Result<()> {
         fs::write(path, data)
     }
 
-    fn rsync(&self, source: &str, dest: &str) -> std::io::Result<()> {
+    fn rsync(&self, source: &Path, dest: &Path) -> std::io::Result<()> {
         if Path::exists(Path::new(dest)) {
             let metadata = fs::metadata(Path::new(dest))?;
             if !metadata.is_dir() {
@@ -109,8 +112,30 @@ impl FsTraits for FsImpl {
         fs::create_dir_all(path)
     }
 
-    fn remove_file(&self, path: &str) -> std::io::Result<()> {
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
         fs::remove_file(path)
+    }
+
+    fn cp_al(&self, source: &Path, dest: &Path) -> std::io::Result<()> {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "/usr/bin/cp -al {} {}",
+                source.to_str().unwrap(),
+                dest.to_str().unwrap()
+            ))
+            .output()
+            .expect("failed to execute process");
+        std::io::stdout().write_all(&output.stdout).unwrap();
+        std::io::stderr().write_all(&output.stderr).unwrap();
+        if !output.status.success() {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "cp failed"));
+        }
+        Ok(())
+    }
+
+    fn mv(&self, source: &Path, dest: &Path) -> std::io::Result<()> {
+        fs::rename(source, dest)
     }
 }
 
@@ -120,11 +145,33 @@ struct Settings {
     ignore_others: bool,
 }
 
+use std::cmp::Ordering;
+
 struct PeriodInfo {
     name: String,
     count: u32,
     interval: Duration,
 }
+
+impl Ord for PeriodInfo {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.interval.cmp(&other.interval)
+    }
+}
+
+impl PartialOrd for PeriodInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PeriodInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.interval == other.interval
+    }
+}
+
+impl Eq for PeriodInfo {}
 
 fn main() -> Result<(), String> {
     let args = Args::parse();
@@ -161,7 +208,7 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
 
     if !settings.ignore_others {
         // exit if pid file exists and pid exists
-        let other_pid = get_other_pid(&context, &pid_path)?;
+        let other_pid = get_other_pid(&context, Path::new(&pid_path))?;
         match other_pid {
             Some(pid) => return Err(format!("Already running with PID: {:?}", pid)),
             None => (),
@@ -172,7 +219,7 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
 
     let pid_thread = move |path: String| {
         fsimpl_pid_thread
-            .write(&path, &format!("{}", std::process::id()))
+            .write(Path::new(&path), &format!("{}", std::process::id()))
             .unwrap();
         for _ in 1..600 {
             thread::sleep(Duration::from_millis(100));
@@ -193,7 +240,7 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
     let _ = stop_pid_thread_tx.send("done");
     let _ = pid_handle.join();
 
-    match context.fsimpl.remove_file(&pid_path) {
+    match context.fsimpl.remove_file(Path::new(&pid_path)) {
         Ok(()) => (),
         Err(error) => {
             return Err(format!(
@@ -208,8 +255,144 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
 
 fn do_work(settings: Settings, context: &Context) -> Result<(), String> {
     let target_root = get_conf_key(&settings.config, "main", "target_root")?;
-    let target_path = Path::new(&target_root);
-    if context.fsimpl.path_exists(&target_path) {
+
+    ensure_target_root_exists(&target_root, context, &settings)?;
+
+    rsync_sources(&settings, &target_root, context)?;
+
+    let periods_set = match parse_periods(settings) {
+        Ok(value) => value,
+        Err(value) => return value,
+    };
+
+    for period in periods_set.iter() {
+        if period == periods_set.first().unwrap() {
+            //   shortest period
+            //     if most recent is old enough then
+            //       rm period.oldest if too many
+            //       mv period.n-1 period.n if period.n-1 exists
+            //       cp -al .sync period.0
+            let most_recent_path = Path::new(&target_root).join(format!("{}.0", period.name));
+
+            let age_secs = get_path_age_secs(context, most_recent_path.as_path())?;
+
+            println!(
+                "Most recent period {:?} age {}s, comparing with {}s",
+                most_recent_path,
+                age_secs,
+                period.interval.as_secs()
+            );
+
+            if age_secs >= period.interval.as_secs() {
+                println!("Most recent period is old enough");
+
+                // Remove any copies we no longer need
+                for suffix in period.count..102 {
+                    let path = Path::new(&target_root).join(format!("{}.{}", period.name, suffix));
+                    if context.fsimpl.path_exists(&path) {
+                        println!("Removing period {:?}", path);
+                        match context.fsimpl.remove_file(path.as_path()) {
+                            Ok(()) => (),
+                            Err(error) => {
+                                return Err(format!(
+                                    "Could not remove period {:?}: {:?}",
+                                    path, error
+                                ))
+                            }
+                        }
+                    }
+                }
+
+                for suffix in 0..period.count + 1 {
+                    let path = Path::new(&target_root).join(format!("{}.{}", period.name, suffix));
+                    if !context.fsimpl.path_exists(&path) {
+                        for mv_suffix in (1..suffix).rev() {
+                            let from_path = Path::new(&target_root).join(format!(
+                                "{}.{}",
+                                period.name,
+                                mv_suffix - 1
+                            ));
+                            let to_path = Path::new(&target_root)
+                                .join(format!("{}.{}", period.name, mv_suffix));
+                            match context.fsimpl.mv(&from_path.as_path(), &to_path.as_path()) {
+                                Ok(()) => (),
+                                Err(error) => {
+                                    return Err(format!(
+                                        "Could not move {:?} to {:?}: {:?}",
+                                        from_path, to_path, error
+                                    ))
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                match context
+                    .fsimpl
+                    .cp_al(&Path::new(&target_root).join(".sync"), &most_recent_path)
+                {
+                    Ok(()) => (),
+                    Err(error) => {
+                        return Err(format!(
+                            "Could not cp .sync to {:?}: {:?}",
+                            most_recent_path, error
+                        ))
+                    }
+                }
+            }
+        } else {
+            //   not shortest period
+            //     if most_recent(this period) - oldest(shorter period) >= interval
+            //       rm period.oldest if too many
+            //       mv period.n-1 period.n if period.n-1 exists
+            //       mv oldest(shorter period) period.0
+        }
+    }
+    Ok(())
+}
+
+fn rsync_sources(
+    settings: &Settings,
+    target_root: &String,
+    context: &Context,
+) -> Result<(), String> {
+    let sources = match settings.config.get("sources") {
+        Some(main) => main,
+        None => return Err(String::from("No sources section in config")),
+    };
+    for (source, dest) in sources {
+        match dest {
+            Some(_) => (),
+            None => return Err(format!("No destination for source {:?}", source)),
+        }
+
+        println!("SOURCE {:?} DEST {:?}", source, dest.clone().unwrap());
+
+        let dest_path = Path::new(&target_root)
+            .join(".sync")
+            .join(dest.clone().unwrap());
+
+        match context.fsimpl.rsync(Path::new(source), dest_path.as_path()) {
+            Ok(_) => (),
+            Err(error) => {
+                return Err(format!(
+                    "Could not rsync {} to {:?}: {:?}",
+                    source, dest_path, error
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_target_root_exists(
+    target_root: &String,
+    context: &Context,
+    settings: &Settings,
+) -> Result<(), String> {
+    let target_path = Path::new(target_root);
+    Ok(if context.fsimpl.path_exists(&target_path) {
         if !context.fsimpl.is_dir(&target_path)? {
             return Err(format!("{} is not a directory", target_root));
         }
@@ -227,46 +410,21 @@ fn do_work(settings: Settings, context: &Context) -> Result<(), String> {
         } else {
             return Err(format!("Target root {:?} does not exist", target_root));
         }
-    }
-    let sources = match settings.config.get("sources") {
-        Some(main) => main,
-        None => return Err(String::from("No sources section in config")),
-    };
-    for (source, dest) in sources {
-        match dest {
-            Some(_) => (),
-            None => return Err(format!("No destination for source {:?}", source)),
-        }
+    })
+}
 
-        println!("SOURCE {:?} DEST {:?}", source, dest.clone().unwrap());
-
-        let dest_path = Path::new(&target_root)
-            .join(dest.clone().unwrap())
-            .join(".sync");
-
-        match context.fsimpl.rsync(source, dest_path.to_str().unwrap()) {
-            Ok(_) => (),
-            Err(error) => {
-                return Err(format!(
-                    "Could not rsync {} to {:?}: {:?}",
-                    source, dest_path, error
-                ))
-            }
-        }
-    }
+fn parse_periods(settings: Settings) -> Result<SortedSet<PeriodInfo>, Result<(), String>> {
     let periods = match settings.config.get("periods") {
         Some(main) => main,
-        None => return Err(String::from("No periods section in config")),
+        None => return Err(Err(String::from("No periods section in config"))),
     };
-
-    let mut periods_vec = Vec::new();
-
+    let mut periods_set = SortedSet::new();
     for (period_name, details) in periods {
         if period_name.len() == 0 {
-            return Err(String::from("An empty period name was found"));
+            return Err(Err(String::from("An empty period name was found")));
         }
         if filenamify(&period_name).ne(period_name) {
-            return Err(format!("Invalid period name: {}", period_name));
+            return Err(Err(format!("Invalid period name: {}", period_name)));
         }
         /*
         if periods_vec
@@ -279,65 +437,52 @@ fn do_work(settings: Settings, context: &Context) -> Result<(), String> {
         let details_str = details.clone().unwrap_or("".to_string());
         let parts = details_str.split("@").collect::<Vec<&str>>();
         if parts.len() != 2 {
-            return Err(format!(
+            return Err(Err(format!(
                 "Invalid period details (should be <count>@<interval>) for {}: {}",
                 period_name, details_str
-            ));
+            )));
         }
         let count = match parts[0].parse::<u32>() {
             Ok(count) => count,
             Err(_) => {
-                return Err(format!(
+                return Err(Err(format!(
                     "Could not parse count (should be 1-100) for {}: {}",
                     period_name, details_str
-                ))
+                )))
             }
         };
         if count < 1 || count > 100 {
-            return Err(format!(
+            return Err(Err(format!(
                 "Count should be 1-100 for {}: {}",
                 period_name, details_str
-            ));
+            )));
         }
         let duration = DurationString::from_string(parts[1].to_string());
         let interval: Duration = match duration {
             Ok(duration) => duration.into(),
             Err(_) => {
-                return Err(format!(
+                return Err(Err(format!(
                     "Could not parse interval (should be 1s-1y) for {}: {}",
                     period_name, details_str
-                ))
+                )))
             }
         };
         if interval < Duration::from_secs(60 * 60)
             || interval > Duration::from_secs(60 * 60 * 24 * 365 * 5)
         {
-            return Err(format!(
+            return Err(Err(format!(
                 "Interval should be 1h-5y for {}: {}",
                 period_name, details_str
-            ));
+            )));
         }
 
-        periods_vec.push(PeriodInfo {
+        periods_set.push(PeriodInfo {
             name: period_name.clone(),
             count: count,
             interval: interval,
         });
     }
-
-    for period in periods_vec {
-        //   if shortest period
-        //     if most recent is old enough then
-        //       rm period.oldest if too many
-        //       mv period.n-1 period.n if period.n-1 exists
-        //       cp -al .sync period.0
-        //   else
-        //     if most_recent(this period) - oldest(shorter period) >= interval
-        //       rm period.oldest if too many
-        //       mv period.n-1 period.n if period.n-1 exists
-        //       mv oldest(shorter period) period.0
-    }
-    Ok(())
+    Ok(periods_set)
 }
 
 fn get_conf_key(
@@ -365,10 +510,10 @@ struct Context {
     fsimpl: Box<dyn FsTraits>,
 }
 
-fn get_other_pid(context: &Context, pid_path: &str) -> Result<Option<String>, String> {
+fn get_other_pid(context: &Context, pid_path: &Path) -> Result<Option<String>, String> {
     println!("Checking PID file {:?}", pid_path);
-    let result = context.fsimpl.read_to_string(pid_path);
-    let pid = match result {
+
+    let pid = match context.fsimpl.read_to_string(pid_path) {
         Ok(pid) => pid,
         Err(ref error) if error.kind() == std::io::ErrorKind::NotFound => {
             println!("PID file {:?} not found", pid_path);
@@ -384,8 +529,19 @@ fn get_other_pid(context: &Context, pid_path: &str) -> Result<Option<String>, St
         }
     };
 
-    let result = context.fsimpl.mtime(pid_path);
-    let mtime = match result {
+    let age_secs = get_path_age_secs(context, pid_path)?;
+
+    if age_secs > 300 {
+        println!("PID file {:?} written more than 5 minutes ago", pid_path);
+        return Ok(None);
+    }
+
+    println!("PID file {:?} written recently by PID {:?}", pid_path, pid);
+    Ok(Some(pid))
+}
+
+fn get_path_age_secs(context: &Context, pid_path: &Path) -> Result<u64, String> {
+    let mtime = match context.fsimpl.mtime(pid_path) {
         Ok(mtime) => mtime,
         Err(error) => {
             return Err(format!(
@@ -396,24 +552,15 @@ fn get_other_pid(context: &Context, pid_path: &str) -> Result<Option<String>, St
             ))
         }
     };
-
     let age_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
         - <i64 as TryInto<u64>>::try_into(mtime.unix_seconds()).unwrap();
-
-    println!("PID file written at {:?}", mtime);
+    println!("File mtime {:?}", mtime);
     println!("Time now {:?}", SystemTime::now());
     println!("Age {:?} secs", age_secs);
-
-    if age_secs > 300 {
-        println!("PID file {:?} written more than 5 minutes ago", pid_path);
-        return Ok(None);
-    }
-
-    println!("PID file {:?} written recently by PID {:?}", pid_path, pid);
-    Ok(Some(pid))
+    Ok(age_secs)
 }
 
 #[cfg(test)]
@@ -427,14 +574,16 @@ mod tests {
         pub FsImpl {
         }
         impl FsTraits for FsImpl {
-            fn read_to_string(&self, path: &str) -> std::io::Result<String>;
-            fn mtime(&self, path: &str) -> std::io::Result<FileTime>;
-            fn write(&self, path: &str, data: &str) -> std::io::Result<()>;
-            fn rsync(&self, source: &str, dest: &str) -> std::io::Result<()>;
+            fn read_to_string(&self, path: &Path) -> std::io::Result<String>;
+            fn mtime(&self, path: &Path) -> std::io::Result<FileTime>;
+            fn write(&self, path: &Path, data: &str) -> std::io::Result<()>;
+            fn rsync(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
             fn path_exists(&self, path: &Path) -> bool;
             fn is_dir(&self, path: &Path) -> Result<bool, String>;
             fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
-            fn remove_file(&self, path: &str) -> std::io::Result<()>;
+            fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+            fn cp_al(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
+            fn mv(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
         }
         impl Clone for FsImpl {
             fn clone(&self) -> Self;
@@ -627,7 +776,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n/A=/B\n/C=/D\n[periods]",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n/A=./B\n/C=./D\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -659,7 +808,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n/A=/B\n/C=/D",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n/A=./B\n/C=./D",
             ))
             .unwrap();
         let settings = Settings {
@@ -688,13 +837,18 @@ mod tests {
         mock.expect_remove_file().return_once(|_| Ok(()));
 
         let error = body(mock, settings).map_err(|e| e);
-        assert_eq!(
-            error,
-            Err(format!(
-                "Could not rsync /A to {:?}: Custom {{ kind: Other, error: \"rsync failed\" }}",
-                Path::new("/B").join(".sync")
-            ))
-        );
+        let exp1 = Err(format!(
+            "Could not rsync /A to {:?}: Custom {{ kind: Other, error: \"rsync failed\" }}",
+            Path::new(".sync").join("./B")
+        ));
+        let exp2 = Err(format!(
+            "Could not rsync /C to {:?}: Custom {{ kind: Other, error: \"rsync failed\" }}",
+            Path::new(".sync").join("./D")
+        ));
+        println!("ERROR {:?}", error);
+        println!("EXP 1 {:?}", exp1);
+        println!("EXP 2 {:?}", exp2);
+        assert!(error == exp1 || error == exp2);
     }
 
     fn arrange_periods_test(periods: &str) -> (Settings, MockFsImpl) {
@@ -705,8 +859,8 @@ mod tests {
                 pid_file=/var/run/safersync.pid
                 target_root=
                 [sources]
-                /A=/B
-                /C=/D
+                /A=./B
+                /C=./D
                 [periods]
                 {}",
                 periods
