@@ -260,6 +260,16 @@ fn do_work(settings: Settings, context: &Context) -> Result<(), String> {
 
     rsync_sources(&settings, &target_root, context)?;
 
+    rotate_periods(settings, target_root, context)?;
+
+    Ok(())
+}
+
+fn rotate_periods(
+    settings: Settings,
+    target_root: String,
+    context: &Context,
+) -> Result<(), String> {
     let periods_set = match parse_periods(settings) {
         Ok(value) => value,
         Err(value) => return value,
@@ -274,7 +284,11 @@ fn do_work(settings: Settings, context: &Context) -> Result<(), String> {
             //       cp -al .sync period.0
             let most_recent_path = Path::new(&target_root).join(format!("{}.0", period.name));
 
-            let age_secs = get_path_age_secs(context, most_recent_path.as_path())?;
+            let age_secs = if context.fsimpl.path_exists(most_recent_path.as_path()) {
+                get_path_age_secs(context, most_recent_path.as_path())?
+            } else {
+                u64::MAX
+            };
 
             println!(
                 "Most recent period {:?} age {}s, comparing with {}s",
@@ -286,69 +300,95 @@ fn do_work(settings: Settings, context: &Context) -> Result<(), String> {
             if age_secs >= period.interval.as_secs() {
                 println!("Most recent period is old enough");
 
-                // Remove any copies we no longer need
-                for suffix in period.count..102 {
-                    let path = Path::new(&target_root).join(format!("{}.{}", period.name, suffix));
-                    if context.fsimpl.path_exists(&path) {
-                        println!("Removing period {:?}", path);
-                        match context.fsimpl.remove_file(path.as_path()) {
-                            Ok(()) => (),
-                            Err(error) => {
-                                return Err(format!(
-                                    "Could not remove period {:?}: {:?}",
-                                    path, error
-                                ))
-                            }
-                        }
-                    }
-                }
+                remove_extra_period_folders(period, &target_root, context)?;
 
-                for suffix in 0..period.count + 1 {
-                    let path = Path::new(&target_root).join(format!("{}.{}", period.name, suffix));
-                    if !context.fsimpl.path_exists(&path) {
-                        for mv_suffix in (1..suffix).rev() {
-                            let from_path = Path::new(&target_root).join(format!(
-                                "{}.{}",
-                                period.name,
-                                mv_suffix - 1
-                            ));
-                            let to_path = Path::new(&target_root)
-                                .join(format!("{}.{}", period.name, mv_suffix));
-                            match context.fsimpl.mv(&from_path.as_path(), &to_path.as_path()) {
-                                Ok(()) => (),
-                                Err(error) => {
-                                    return Err(format!(
-                                        "Could not move {:?} to {:?}: {:?}",
-                                        from_path, to_path, error
-                                    ))
-                                }
-                            }
-                        }
-                        break;
-                    }
-                }
+                rotate_period_folders(period, &target_root, context)?;
 
-                match context
-                    .fsimpl
-                    .cp_al(&Path::new(&target_root).join(".sync"), &most_recent_path)
-                {
-                    Ok(()) => (),
-                    Err(error) => {
-                        return Err(format!(
-                            "Could not cp .sync to {:?}: {:?}",
-                            most_recent_path, error
-                        ))
-                    }
-                }
+                cp_sync_to_period(context, &target_root, most_recent_path)?;
             }
         } else {
             //   not shortest period
-            //     if most_recent(this period) - oldest(shorter period) >= interval
+            //     if shorter period is full && most_recent(this period) - oldest(shorter period) >= interval
             //       rm period.oldest if too many
             //       mv period.n-1 period.n if period.n-1 exists
             //       mv oldest(shorter period) period.0
         }
     }
+
+    Ok(())
+}
+
+fn cp_sync_to_period(
+    context: &Context,
+    target_root: &String,
+    most_recent_path: std::path::PathBuf,
+) -> Result<(), String> {
+    match context
+        .fsimpl
+        .cp_al(&Path::new(target_root).join(".sync"), &most_recent_path)
+    {
+        Ok(()) => (),
+        Err(error) => {
+            return Err(format!(
+                "Could not cp {:?} to {:?}: {:?}",
+                Path::new(&target_root).join(".sync"),
+                most_recent_path,
+                error
+            ))
+        }
+    }
+
+    Ok(())
+}
+
+fn rotate_period_folders(
+    period: &PeriodInfo,
+    target_root: &String,
+    context: &Context,
+) -> Result<(), String> {
+    for suffix in 0..period.count {
+        let path = Path::new(target_root).join(format!("{}.{}", period.name, suffix));
+        if !context.fsimpl.path_exists(&path) {
+            for mv_suffix in (0..suffix).rev() {
+                let from_path =
+                    Path::new(target_root).join(format!("{}.{}", period.name, mv_suffix));
+                let to_path =
+                    Path::new(target_root).join(format!("{}.{}", period.name, mv_suffix + 1));
+                match context.fsimpl.mv(&from_path.as_path(), &to_path.as_path()) {
+                    Ok(()) => (),
+                    Err(error) => {
+                        return Err(format!(
+                            "Could not move {:?} to {:?}: {:?}",
+                            from_path, to_path, error
+                        ))
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_extra_period_folders(
+    period: &PeriodInfo,
+    target_root: &String,
+    context: &Context,
+) -> Result<(), String> {
+    for suffix in period.count..102 {
+        let path = Path::new(target_root).join(format!("{}.{}", period.name, suffix));
+        if context.fsimpl.path_exists(&path) {
+            println!("Removing period {:?}", path);
+            match context.fsimpl.remove_file(path.as_path()) {
+                Ok(()) => (),
+                Err(error) => {
+                    return Err(format!("Could not remove period {:?}: {:?}", path, error))
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -372,6 +412,25 @@ fn rsync_sources(
         let dest_path = Path::new(&target_root)
             .join(".sync")
             .join(dest.clone().unwrap());
+
+        if !context
+            .fsimpl
+            .path_exists(Path::new(&target_root).join(".sync").as_path())
+        {
+            match context
+                .fsimpl
+                .create_dir_all(Path::new(&target_root).join(".sync").as_path())
+            {
+                Ok(()) => (),
+                Err(error) => {
+                    return Err(format!(
+                        "Could not create .sync dir {:?}: {:?}",
+                        Path::new(&target_root).join(".sync"),
+                        error
+                    ));
+                }
+            }
+        }
 
         match context.fsimpl.rsync(Path::new(source), dest_path.as_path()) {
             Ok(_) => (),
@@ -540,26 +599,25 @@ fn get_other_pid(context: &Context, pid_path: &Path) -> Result<Option<String>, S
     Ok(Some(pid))
 }
 
-fn get_path_age_secs(context: &Context, pid_path: &Path) -> Result<u64, String> {
-    let mtime = match context.fsimpl.mtime(pid_path) {
+fn get_path_age_secs(context: &Context, path: &Path) -> Result<u64, String> {
+    let mtime = match context.fsimpl.mtime(path) {
         Ok(mtime) => mtime,
         Err(error) => {
             return Err(format!(
                 "Could not get mtime of {:?}: {:?} {:?}",
-                pid_path,
+                path,
                 error.kind(),
                 error.to_string()
             ))
         }
     };
-    let age_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+    let now = SystemTime::now();
+    let age_secs = now.duration_since(UNIX_EPOCH).unwrap().as_secs()
         - <i64 as TryInto<u64>>::try_into(mtime.unix_seconds()).unwrap();
-    println!("File mtime {:?}", mtime);
-    println!("Time now {:?}", SystemTime::now());
-    println!("Age {:?} secs", age_secs);
+    println!(
+        "Path {:?} mtime {:?} vs now {:?} = age {:?} secs",
+        path, mtime, now, age_secs
+    );
     Ok(age_secs)
 }
 
@@ -794,7 +852,7 @@ mod tests {
                 "File Not Found",
             ))
         });
-        mock.expect_path_exists().return_once(|_| true);
+        mock.expect_path_exists().times(3).return_const(true);
         mock.expect_is_dir().return_once(|_| Ok(true));
         mock.expect_rsync().times(2).returning(move |_, _| Ok(()));
         mock.expect_remove_file().return_once(|_| Ok(()));
@@ -826,7 +884,7 @@ mod tests {
                 "File Not Found",
             ))
         });
-        mock.expect_path_exists().return_once(|_| true);
+        mock.expect_path_exists().times(2).return_const(true);
         mock.expect_is_dir().return_once(|_| Ok(true));
         mock.expect_rsync().return_once(move |_, _| {
             Err(std::io::Error::new(
@@ -881,7 +939,7 @@ mod tests {
                 "File Not Found",
             ))
         });
-        mock.expect_path_exists().return_once(|_| true);
+        mock.expect_path_exists().times(3).return_const(true);
         mock.expect_is_dir().return_once(|_| Ok(true));
         mock.expect_rsync().times(2).returning(move |_, _| Ok(()));
         mock.expect_remove_file().return_once(|_| Ok(()));
@@ -969,6 +1027,353 @@ mod tests {
         assert_eq!(
             error,
             Err(String::from("Interval should be 1h-5y for a: 1@5y1d"))
+        );
+    }
+
+    #[test]
+    fn if_shortest_period_does_not_exist_then_create_it() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2.expect_write().return_once(move |_, _| Ok(()));
+        mock.expect_clone().return_once(move || mock2);
+        mock.expect_read_to_string().return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists()
+            .times(3 + 101 + 1)
+            .returning(|path| {
+                if path == Path::new("tr") || path == Path::new("tr").join(".sync") {
+                    true
+                } else if path == Path::new("tr").join("hourly.0") {
+                    false
+                } else {
+                    false
+                }
+            });
+        mock.expect_is_dir().return_once(|_| Ok(true));
+        mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
+        mock.expect_cp_al().return_once(|_, _| Ok(()));
+        mock.expect_remove_file().return_once(|_| Ok(()));
+
+        let result = body(mock, settings).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_cannot_create_shortest_period_then_error() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2.expect_write().return_once(move |_, _| Ok(()));
+        mock.expect_clone().return_once(move || mock2);
+        mock.expect_read_to_string().return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists()
+            .times(3 + 101 + 1)
+            .returning(|path| {
+                if path == Path::new("tr") || path == Path::new("tr").join(".sync") {
+                    true
+                } else if path == Path::new("tr").join("hourly.0") {
+                    false
+                } else {
+                    false
+                }
+            });
+        mock.expect_is_dir().return_once(|_| Ok(true));
+        mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
+        mock.expect_cp_al().return_once(|_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_remove_file().return_once(|_| Ok(()));
+
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(format!(
+                "Could not cp {:?} to {:?}: Custom {{ kind: NotFound, error: \"File Not Found\" }}",
+                Path::new("tr").join(".sync"),
+                Path::new("tr").join("hourly.0")
+            ))
+        );
+    }
+
+    #[test]
+    fn if_shortest_period_is_new_then_do_nothing() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2.expect_write().return_once(move |_, _| Ok(()));
+        mock.expect_clone().return_once(move || mock2);
+        mock.expect_read_to_string().return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists().times(3).return_const(true);
+        mock.expect_mtime()
+            .return_once(move |_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_is_dir().return_once(|_| Ok(true));
+        mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
+        mock.expect_remove_file().return_once(|_| Ok(()));
+
+        let result = body(mock, settings).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_shortest_period_is_old_then_remove_old_copies() {
+        let period = PeriodInfo {
+            name: String::from("hourly"),
+            count: 3,
+            interval: Duration::from_secs(3600),
+        };
+        let target_root = String::from(".");
+        let mut mock: MockFsImpl = MockFsImpl::new();
+        mock.expect_path_exists().times(99).returning(|path| {
+            if path == Path::new(".").join("hourly.10") {
+                false
+            } else {
+                true
+            }
+        });
+        mock.expect_remove_file().times(98).returning(|path| {
+            assert!(path != Path::new(".").join("hourly.10"));
+            Ok(())
+        });
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+        let result = remove_extra_period_folders(&period, &target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_cannot_remove_old_shortest_period_then_error() {
+        let period = PeriodInfo {
+            name: String::from("hourly"),
+            count: 3,
+            interval: Duration::from_secs(3600),
+        };
+        let target_root = String::from(".");
+        let mut mock: MockFsImpl = MockFsImpl::new();
+        mock.expect_path_exists().times(8).return_const(true);
+        mock.expect_remove_file().times(8).returning(|path| {
+            if path == Path::new(".").join("hourly.10") {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "File Not Found",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = remove_extra_period_folders(&period, &target_root, &context);
+        assert_eq!(
+            error,
+            Err(format!(
+                "Could not remove period {:?}: Custom {{ kind: NotFound, error: \"File Not Found\" }}",
+                Path::new(".").join("hourly.10")
+            ))
+        );
+    }
+
+    #[test]
+    fn if_shortest_period_is_old_then_rotate_folders() {
+        let period = PeriodInfo {
+            name: String::from("hourly"),
+            count: 3,
+            interval: Duration::from_secs(3600),
+        };
+        let target_root = String::from(".");
+        let mut mock: MockFsImpl = MockFsImpl::new();
+        mock.expect_path_exists().times(3).returning(|path| {
+            if path == Path::new(".").join("hourly.2") {
+                false
+            } else {
+                true
+            }
+        });
+        mock.expect_mv()
+            .withf(|f, t| {
+                f == Path::new(".").join("hourly.1") && t == Path::new(".").join("hourly.2")
+            })
+            .return_once(|_, _| Ok(()));
+        mock.expect_mv()
+            .withf(|f, t| {
+                f == Path::new(".").join("hourly.0") && t == Path::new(".").join("hourly.1")
+            })
+            .return_once(|_, _| Ok(()));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+        let result = rotate_period_folders(&period, &target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_cannot_rotate_shortest_period_then_error() {
+        let period = PeriodInfo {
+            name: String::from("hourly"),
+            count: 3,
+            interval: Duration::from_secs(3600),
+        };
+        let target_root = String::from(".");
+        let mut mock: MockFsImpl = MockFsImpl::new();
+        mock.expect_path_exists().times(3).returning(|path| {
+            if path == Path::new(".").join("hourly.2") {
+                false
+            } else {
+                true
+            }
+        });
+        mock.expect_mv()
+            .withf(|f, t| {
+                f == Path::new(".").join("hourly.1") && t == Path::new(".").join("hourly.2")
+            })
+            .return_once(|_, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "File Not Found",
+                ))
+            });
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = rotate_period_folders(&period, &target_root, &context);
+        assert_eq!(
+            error,
+            Err(format!(
+                "Could not move {:?} to {:?}: Custom {{ kind: NotFound, error: \"File Not Found\" }}",
+                Path::new(".").join("hourly.1"),
+                Path::new(".").join("hourly.2")
+            ))
+        );
+    }
+
+    #[test]
+    fn if_shortest_period_is_old_then_cp_sync_folder() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+        let mut mock: MockFsImpl = MockFsImpl::new();
+        mock.expect_path_exists().times(103).returning(|path| {
+            if path == Path::new(".").join("hourly.0") {
+                true
+            } else {
+                false
+            }
+        });
+        mock.expect_mtime().return_once(move |_| {
+            Ok(FileTime::from_system_time(
+                std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600)),
+            ))
+        });
+        mock.expect_cp_al().return_once(|_, _| Ok(()));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+        let result = rotate_periods(settings, target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_cannot_cp_sync_to_shortest_period_then_error() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+        let mut mock: MockFsImpl = MockFsImpl::new();
+        mock.expect_path_exists().times(103).returning(|path| {
+            if path == Path::new(".").join("hourly.0") {
+                true
+            } else {
+                false
+            }
+        });
+        mock.expect_mtime().return_once(move |_| {
+            Ok(FileTime::from_system_time(
+                std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600)),
+            ))
+        });
+        mock.expect_cp_al().return_once(|_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+        let error = rotate_periods(settings, target_root, &context);
+        assert_eq!(
+            error,
+            Err(format!(
+                "Could not cp {:?} to {:?}: Custom {{ kind: NotFound, error: \"File Not Found\" }}",
+                Path::new(".").join(".sync"),
+                Path::new(".").join("hourly.0")
+            ))
         );
     }
 }
