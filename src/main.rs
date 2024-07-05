@@ -147,7 +147,7 @@ struct Settings {
 
 use std::cmp::Ordering;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct PeriodInfo {
     name: String,
     count: u32,
@@ -276,24 +276,31 @@ fn rotate_periods(
         Err(value) => return value,
     };
 
+    let mut optional_last_period: Option<PeriodInfo> = None;
+
     for period in periods_set.iter() {
         if period == periods_set.first().unwrap() {
             //   shortest period
             //     if most recent is old enough then
-            //       rm period.oldest if too many
+            //       rm extra folders
+            //       rm period.oldest if already full
             //       mv period.n-1 period.n if period.n-1 exists
             //       cp -al .sync period.0
-            let most_recent_path = Path::new(&target_root).join(format!("{}.0", period.name));
+            let newest_path_this_period =
+                Path::new(&target_root).join(format!("{}.0", period.name));
 
-            let age_secs = if context.fsimpl.path_exists(most_recent_path.as_path()) {
-                get_path_age_secs(context, most_recent_path.as_path())?
+            let age_secs = if context
+                .fsimpl
+                .path_exists(newest_path_this_period.as_path())
+            {
+                get_path_age_secs(context, newest_path_this_period.as_path())?
             } else {
                 u64::MAX
             };
 
             println!(
                 "Most recent period {:?} age {}s, comparing with {}s",
-                most_recent_path,
+                newest_path_this_period,
                 age_secs,
                 period.interval.as_secs()
             );
@@ -305,14 +312,84 @@ fn rotate_periods(
 
                 rotate_period_folders(period, &target_root, context)?;
 
-                cp_sync_to_period(context, &target_root, most_recent_path)?;
+                cp_sync_to_period(context, &target_root, newest_path_this_period)?;
             }
         } else {
             //   not shortest period
             //     if shorter period is full && most_recent(this period) - oldest(shorter period) >= interval
-            //       rm period.oldest if too many
+            //       rm extra folders
+            //       rm period.oldest if already full
             //       mv period.n-1 period.n if period.n-1 exists
             //       mv oldest(shorter period) period.0
+            let last_period = optional_last_period.unwrap();
+            let newest_path_this_period =
+                Path::new(&target_root).join(format!("{}.0", period.name));
+            let oldest_path_last_period = Path::new(&target_root).join(format!(
+                "{}.{}",
+                last_period.name,
+                last_period.count - 1
+            ));
+
+            let this_period_age_secs = if context
+                .fsimpl
+                .path_exists(newest_path_this_period.as_path())
+            {
+                get_path_age_secs(context, newest_path_this_period.as_path())?
+            } else {
+                u64::MAX
+            };
+
+            let last_period_age_secs = if context
+                .fsimpl
+                .path_exists(oldest_path_last_period.as_path())
+            {
+                get_path_age_secs(context, oldest_path_last_period.as_path())?
+            } else {
+                u64::MAX
+            };
+
+            println!(
+                "Most recent period {:?} age {}s, prev period {:?} age {}s, diff {}s, comparing with {}s",
+                newest_path_this_period,
+                this_period_age_secs,
+                oldest_path_last_period,
+                last_period_age_secs,
+                this_period_age_secs - last_period_age_secs,
+                period.interval.as_secs()
+            );
+
+            if this_period_age_secs != u64::MAX
+                && last_period_age_secs != u64::MAX
+                && this_period_age_secs - last_period_age_secs >= period.interval.as_secs()
+            {
+                println!("Most recent period is old enough");
+
+                remove_extra_period_folders(period, &target_root, context)?;
+
+                rotate_period_folders(period, &target_root, context)?;
+
+                mv_periods(context, oldest_path_last_period, newest_path_this_period)?;
+            }
+        }
+
+        optional_last_period = Some(period.clone());
+    }
+
+    Ok(())
+}
+
+fn mv_periods(
+    context: &Context,
+    source: std::path::PathBuf,
+    dest: std::path::PathBuf,
+) -> Result<(), String> {
+    match context.fsimpl.mv(&source, &dest) {
+        Ok(()) => (),
+        Err(error) => {
+            return Err(format!(
+                "Could not mv {:?} to {:?}: {:?}",
+                source, dest, error
+            ))
         }
     }
 
