@@ -1029,7 +1029,31 @@ mod tests {
     }
 
     #[test]
-    fn if_multiple_periods_then_check_sorted() {}
+    fn if_multiple_periods_then_check_sorted() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[periods]
+                a=1@1w
+                b=1@1y
+                c=1@1d
+                d=1@1h",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let result = parse_periods(settings).unwrap();
+        assert_eq!(result.len(), 4);
+        assert_eq!(
+            result
+                .iter()
+                .map(|x| x.name.clone())
+                .collect::<Vec<String>>(),
+            vec!["d", "c", "a", "b"]
+        );
+    }
 
     #[test]
     fn if_invalid_period_name_then_error() {
