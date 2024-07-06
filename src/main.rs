@@ -306,13 +306,18 @@ fn rotate_periods(
             );
 
             if age_secs >= period.interval.as_secs() {
-                println!("Most recent period is old enough");
+                println!("Most recent period {} is old enough, rotating", period.name);
 
                 remove_extra_period_folders(period, &target_root, context)?;
 
                 rotate_period_folders(period, &target_root, context)?;
 
                 cp_sync_to_period(context, &target_root, newest_path_this_period)?;
+            } else {
+                println!(
+                    "Most recent period {} is not old enough, not rotating",
+                    period.name
+                );
             }
         } else {
             //   not shortest period
@@ -348,27 +353,35 @@ fn rotate_periods(
                 u64::MAX
             };
 
+            let diff_secs: f64 = if this_period_age_secs >= last_period_age_secs {
+                (this_period_age_secs - last_period_age_secs) as f64
+            } else {
+                -1.
+            };
+
             println!(
                 "Most recent period {:?} age {}s, prev period {:?} age {}s, diff {}s, comparing with {}s",
                 newest_path_this_period,
                 this_period_age_secs,
                 oldest_path_last_period,
                 last_period_age_secs,
-                this_period_age_secs - last_period_age_secs,
+                diff_secs,
                 period.interval.as_secs()
             );
 
-            if this_period_age_secs != u64::MAX
-                && last_period_age_secs != u64::MAX
-                && this_period_age_secs - last_period_age_secs >= period.interval.as_secs()
-            {
-                println!("Most recent period is old enough");
+            if diff_secs >= period.interval.as_secs() as f64 {
+                println!("Other period {} is old enough, rotating", period.name);
 
                 remove_extra_period_folders(period, &target_root, context)?;
 
                 rotate_period_folders(period, &target_root, context)?;
 
                 mv_periods(context, oldest_path_last_period, newest_path_this_period)?;
+            } else {
+                println!(
+                    "Other period {} is not old enough, not rotating",
+                    period.name
+                );
             }
         }
 
@@ -1648,4 +1661,266 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn if_shortest_period_is_not_full_then_do_not_create_other_period() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists().times(3).returning(|path| {
+            if path == Path::new(".").join("hourly.1") {
+                false
+            } else if path == Path::new(".").join("daily.0") {
+                false
+            } else {
+                true
+            }
+        });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_shortest_period_is_full_and_other_period_does_not_exist_then_mv() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists()
+            .times(4 + 101 + 1)
+            .returning(|path| {
+                if path == Path::new(".").join("hourly.0")
+                    || path == Path::new(".").join("hourly.1")
+                {
+                    true
+                } else {
+                    false
+                }
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 24)),
+                ))
+            });
+        mock.expect_mv().times(1).return_once(|_, _| Ok(()));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_shortest_period_is_full_and_other_period_is_new_then_do_nothing() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists().times(3).returning(|path| {
+            if path == Path::new(".").join("hourly.0")
+                || path == Path::new(".").join("hourly.1")
+                || path == Path::new(".").join("daily.0")
+            {
+                true
+            } else {
+                false
+            }
+        });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 24)),
+                ))
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 24)),
+                ))
+            });
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_shortest_period_is_older_than_other_period_then_do_nothing() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists().times(3).returning(|path| {
+            if path == Path::new(".").join("hourly.0")
+                || path == Path::new(".").join("hourly.1")
+                || path == Path::new(".").join("daily.0")
+            {
+                true
+            } else {
+                false
+            }
+        });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 24)),
+                ))
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_shortest_period_is_full_and_other_period_is_old_then_mv() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists()
+            .times(4 + 101 + 1)
+            .returning(|path| {
+                if path == Path::new(".").join("hourly.0")
+                    || path == Path::new(".").join("hourly.1")
+                    || path == Path::new(".").join("daily.0")
+                {
+                    true
+                } else {
+                    false
+                }
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 24)),
+                ))
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 24)),
+                ))
+            });
+        mock.expect_mv().times(1).return_once(|_, _| Ok(()));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_cannot_mv_to_other_period_then_error() {}
+
+    #[test]
+    fn if_other_period_is_old_then_remove_old_copies() {}
+
+    #[test]
+    fn if_cannot_remove_old_other_period_then_error() {}
+
+    #[test]
+    fn if_other_period_is_old_then_rotate_folders() {}
+
+    #[test]
+    fn if_cannot_rotate_other_period_then_error() {}
+
+    #[test]
+    fn if_other_period_is_old_and_folders_full_then_remove_oldest() {}
+
+    #[test]
+    fn if_other_period_is_old_and_folders_full_and_remove_fails_then_error() {}
 }
