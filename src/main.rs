@@ -35,6 +35,7 @@ trait FsTraits: Send {
     fn is_dir(&self, path: &Path) -> Result<bool, String>;
     fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+    fn remove_dir_all(&self, path: &Path) -> std::io::Result<()>;
 }
 
 #[derive(Clone)]
@@ -136,6 +137,10 @@ impl FsTraits for FsImpl {
 
     fn mv(&self, source: &Path, dest: &Path) -> std::io::Result<()> {
         fs::rename(source, dest)
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        fs::remove_dir_all(path)
     }
 }
 
@@ -440,7 +445,7 @@ fn rotate_period_folders(
     for suffix in 0..period.count {
         let path = Path::new(target_root).join(format!("{}.{}", period.name, suffix));
         if suffix == period.count - 1 && context.fsimpl.path_exists(&path) {
-            match context.fsimpl.remove_file(path.as_path()) {
+            match context.fsimpl.remove_dir_all(path.as_path()) {
                 Ok(()) => (),
                 Err(error) => return Err(format!("Could not remove {:?}: {:?}", path, error)),
             }
@@ -593,14 +598,7 @@ fn parse_periods(settings: Settings) -> Result<SortedSet<PeriodInfo>, Result<(),
         if filenamify(&period_name).ne(period_name) {
             return Err(Err(format!("Invalid period name: {}", period_name)));
         }
-        /*
-        if periods_vec
-            .iter()
-            .any(|other: &PeriodInfo| other.name.eq(period_name))
-        {
-            return Err(format!("Duplicate period name: {}", period_name));
-        }
-        */
+
         let details_str = details.clone().unwrap_or("".to_string());
         let parts = details_str.split("@").collect::<Vec<&str>>();
         if parts.len() != 2 {
@@ -753,6 +751,7 @@ mod tests {
             fn remove_file(&self, path: &Path) -> std::io::Result<()>;
             fn cp_al(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
             fn mv(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
+            fn remove_dir_all(&self, path: &Path) -> std::io::Result<()>;
         }
         impl Clone for FsImpl {
             fn clone(&self) -> Self;
@@ -1518,7 +1517,7 @@ mod tests {
         let target_root = String::from(".");
         let mut mock = MockFsImpl::new();
         mock.expect_path_exists().times(3).return_const(true);
-        mock.expect_remove_file()
+        mock.expect_remove_dir_all()
             .withf(|path| path == Path::new(".").join("hourly.2"))
             .times(1)
             .return_once(|_| Ok(()));
@@ -1551,7 +1550,7 @@ mod tests {
         let target_root = String::from(".");
         let mut mock = MockFsImpl::new();
         mock.expect_path_exists().times(3).return_const(true);
-        mock.expect_remove_file()
+        mock.expect_remove_dir_all()
             .times(1)
             .withf(|path| path == Path::new(".").join("hourly.2"))
             .return_once(|_| {
@@ -1595,7 +1594,7 @@ mod tests {
                 false
             }
         });
-        mock.expect_remove_file()
+        mock.expect_remove_dir_all()
             .withf(|path| path == Path::new(".").join("hourly.0"))
             .times(1)
             .return_once(|_| Ok(()));
@@ -1633,7 +1632,7 @@ mod tests {
                 false
             }
         });
-        mock.expect_remove_file()
+        mock.expect_remove_dir_all()
             .withf(|path| path == Path::new(".").join("hourly.0"))
             .times(1)
             .return_once(|_| Ok(()));
@@ -1863,7 +1862,7 @@ mod tests {
 
         let mut mock = MockFsImpl::new();
         mock.expect_path_exists()
-            .times(4 + 101 + 1)
+            .times(3 + 101 + 1)
             .returning(|path| {
                 if path == Path::new(".").join("hourly.0")
                     || path == Path::new(".").join("hourly.1")
@@ -1883,7 +1882,7 @@ mod tests {
             .withf(|path| path == Path::new(".").join("hourly.1"))
             .returning(|_| {
                 Ok(FileTime::from_system_time(
-                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 24)),
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600)),
                 ))
             });
         mock.expect_mtime()
@@ -1891,9 +1890,12 @@ mod tests {
             .withf(|path| path == Path::new(".").join("daily.0"))
             .returning(|_| {
                 Ok(FileTime::from_system_time(
-                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 24)),
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 25)),
                 ))
             });
+        mock.expect_remove_dir_all()
+            .times(1)
+            .return_once(|_| Ok(()));
         mock.expect_mv().times(1).return_once(|_, _| Ok(()));
         let context = Context {
             fsimpl: Box::new(mock),
@@ -1904,23 +1906,419 @@ mod tests {
     }
 
     #[test]
-    fn if_cannot_mv_to_other_period_then_error() {}
+    fn if_cannot_mv_to_other_period_then_error() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists()
+            .times(3 + 101 + 1)
+            .returning(|path| {
+                if path == Path::new(".").join("hourly.0")
+                    || path == Path::new(".").join("hourly.1")
+                    || path == Path::new(".").join("daily.0")
+                {
+                    true
+                } else {
+                    false
+                }
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600)),
+                ))
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 25)),
+                ))
+            });
+        mock.expect_remove_dir_all()
+            .times(1)
+            .return_once(|_| Ok(()));
+        mock.expect_mv()
+            .times(1)
+            .return_once(|_, _| Err(std::io::Error::new(std::io::ErrorKind::Other, "error")));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = rotate_periods(settings, target_root, &context).map_err(|e| e);
+        let exp_error = Err(format!(
+            "Could not mv {:?} to {:?}: Custom {{ kind: Other, error: \"error\" }}",
+            Path::new(".").join("hourly.1"),
+            Path::new(".").join("daily.0")
+        ));
+        assert_eq!(error, exp_error);
+    }
 
     #[test]
-    fn if_other_period_is_old_then_remove_old_copies() {}
+    fn if_cannot_remove_old_other_period_then_error() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists()
+            .times(3 + 101 + 1)
+            .returning(|path| {
+                if path == Path::new(".").join("hourly.0")
+                    || path == Path::new(".").join("hourly.1")
+                    || path == Path::new(".").join("daily.0")
+                {
+                    true
+                } else {
+                    false
+                }
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600)),
+                ))
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 25)),
+                ))
+            });
+        mock.expect_remove_dir_all()
+            .times(1)
+            .return_once(|_| Err(std::io::Error::new(std::io::ErrorKind::Other, "error")));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = rotate_periods(settings, target_root, &context).map_err(|e| e);
+        let exp_error = Err(format!(
+            "Could not remove {:?}: Custom {{ kind: Other, error: \"error\" }}",
+            Path::new(".").join("daily.0")
+        ));
+        assert_eq!(error, exp_error);
+    }
 
     #[test]
-    fn if_cannot_remove_old_other_period_then_error() {}
+    fn if_other_period_is_old_then_rotate_folders() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=2@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists()
+            .times(3 + 101 + 2)
+            .returning(|path| {
+                if path == Path::new(".").join("hourly.0")
+                    || path == Path::new(".").join("hourly.1")
+                    || path == Path::new(".").join("daily.0")
+                {
+                    true
+                } else {
+                    false
+                }
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600)),
+                ))
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 25)),
+                ))
+            });
+        mock.expect_mv().times(2).returning(|_, _| Ok(()));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
 
     #[test]
-    fn if_other_period_is_old_then_rotate_folders() {}
+    fn if_cannot_rotate_other_period_then_error() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=2@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists()
+            .times(3 + 101 + 2)
+            .returning(|path| {
+                if path == Path::new(".").join("hourly.0")
+                    || path == Path::new(".").join("hourly.1")
+                    || path == Path::new(".").join("daily.0")
+                {
+                    true
+                } else {
+                    false
+                }
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600)),
+                ))
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 25)),
+                ))
+            });
+        mock.expect_mv()
+            .times(1)
+            .returning(|_, _| Err(std::io::Error::new(std::io::ErrorKind::Other, "error")));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = rotate_periods(settings, target_root, &context).map_err(|e| e);
+        let exp_error = Err(format!(
+            "Could not move {:?} to {:?}: Custom {{ kind: Other, error: \"error\" }}",
+            Path::new(".").join("daily.0"),
+            Path::new(".").join("daily.1")
+        ));
+        assert_eq!(error, exp_error);
+    }
 
     #[test]
-    fn if_cannot_rotate_other_period_then_error() {}
+    fn if_other_period_is_old_and_folders_full_then_remove_oldest() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=2@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists()
+            .times(3 + 101 + 1)
+            .returning(|path| {
+                if path == Path::new(".").join("hourly.0")
+                    || path == Path::new(".").join("hourly.1")
+                    || path == Path::new(".").join("daily.0")
+                    || path == Path::new(".").join("daily.1")
+                {
+                    true
+                } else {
+                    false
+                }
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600)),
+                ))
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 25)),
+                ))
+            });
+        mock.expect_remove_dir_all()
+            .times(1)
+            .return_once(|_| Ok(()));
+        mock.expect_mv().times(2).returning(|_, _| Ok(()));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
 
     #[test]
-    fn if_other_period_is_old_and_folders_full_then_remove_oldest() {}
+    fn if_other_period_is_old_and_folders_not_full_then_do_nothing() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=3@1h\ndaily=2@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists().times(3).returning(|path| {
+            if path == Path::new(".").join("hourly.0")
+                || path == Path::new(".").join("hourly.1")
+                || path == Path::new(".").join("daily.0")
+                || path == Path::new(".").join("daily.1")
+            {
+                true
+            } else {
+                false
+            }
+        });
+
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 25)),
+                ))
+            });
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, target_root, &context).unwrap();
+        assert_eq!(result, ());
+    }
 
     #[test]
-    fn if_other_period_is_old_and_folders_full_and_remove_fails_then_error() {}
+    fn if_other_period_is_old_and_folders_full_and_remove_fails_then_error() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=2@1d",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+        let target_root = String::from(".");
+
+        let mut mock = MockFsImpl::new();
+        mock.expect_path_exists()
+            .times(3 + 101 + 1)
+            .returning(|path| {
+                if path == Path::new(".").join("hourly.0")
+                    || path == Path::new(".").join("hourly.1")
+                    || path == Path::new(".").join("daily.0")
+                    || path == Path::new(".").join("daily.1")
+                {
+                    true
+                } else {
+                    false
+                }
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.0"))
+            .returning(|_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("hourly.1"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600)),
+                ))
+            });
+        mock.expect_mtime()
+            .times(1)
+            .withf(|path| path == Path::new(".").join("daily.0"))
+            .returning(|_| {
+                Ok(FileTime::from_system_time(
+                    std::time::SystemTime::now().sub(std::time::Duration::from_secs(3600 * 25)),
+                ))
+            });
+        mock.expect_remove_dir_all()
+            .times(1)
+            .return_once(|_| Err(std::io::Error::new(std::io::ErrorKind::Other, "error")));
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = rotate_periods(settings, target_root, &context).map_err(|e| e);
+        let exp_error = Err(format!(
+            "Could not remove {:?}: Custom {{ kind: Other, error: \"error\" }}",
+            Path::new(".").join("daily.1")
+        ));
+        assert_eq!(error, exp_error);
+    }
 }
