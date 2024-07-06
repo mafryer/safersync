@@ -43,6 +43,7 @@ struct FsImpl {}
 
 unsafe impl Send for FsImpl {}
 
+#[mutants::skip]
 impl FsTraits for FsImpl {
     fn read_to_string(&self, path: &Path) -> std::io::Result<String> {
         fs::read_to_string(path)
@@ -165,6 +166,7 @@ impl Ord for PeriodInfo {
     }
 }
 
+#[mutants::skip]
 impl PartialOrd for PeriodInfo {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -179,6 +181,7 @@ impl PartialEq for PeriodInfo {
 
 impl Eq for PeriodInfo {}
 
+#[mutants::skip]
 fn main() -> Result<(), String> {
     let args = Args::parse();
     let settings = Settings {
@@ -193,6 +196,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
+#[mutants::skip]
 fn load_config(
     conf_path: String,
 ) -> Result<
@@ -210,7 +214,7 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
         fsimpl: Box::new(fsimpl),
     };
 
-    let pid_path = get_conf_key(&settings.config, "main", "pid_file")?;
+    let pid_path = get_conf_key(&settings.config, "main", "pid_file", Option::None)?;
 
     if !settings.ignore_others {
         // exit if pid file exists and pid exists
@@ -260,7 +264,7 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
 }
 
 fn do_work(settings: Settings, context: &Context) -> Result<(), String> {
-    let target_root = get_conf_key(&settings.config, "main", "target_root")?;
+    let target_root = get_conf_key(&settings.config, "main", "target_root", Option::None)?;
 
     ensure_target_root_exists(&target_root, context, &settings)?;
 
@@ -358,10 +362,10 @@ fn rotate_periods(
                 u64::MAX
             };
 
-            let diff_secs: f64 = if this_period_age_secs >= last_period_age_secs {
-                (this_period_age_secs - last_period_age_secs) as f64
+            let diff_secs = if this_period_age_secs >= last_period_age_secs {
+                Some(this_period_age_secs - last_period_age_secs)
             } else {
-                -1.
+                Option::None
             };
 
             println!(
@@ -370,11 +374,11 @@ fn rotate_periods(
                 this_period_age_secs,
                 oldest_path_last_period,
                 last_period_age_secs,
-                diff_secs,
+                match diff_secs { Some(number) => number.to_string(), None => "?".to_string()},
                 period.interval.as_secs()
             );
 
-            if diff_secs >= period.interval.as_secs() as f64 {
+            if diff_secs.is_some() && diff_secs.unwrap() >= period.interval.as_secs() {
                 println!("Other period {} is old enough, rotating", period.name);
 
                 remove_extra_period_folders(period, &target_root, context)?;
@@ -569,7 +573,13 @@ fn ensure_target_root_exists(
             return Err(format!("{} is not a directory", target_root));
         }
     } else {
-        if get_conf_key(&settings.config, "main", "can_create_target_root")? == "true" {
+        if get_conf_key(
+            &settings.config,
+            "main",
+            "can_create_target_root",
+            Some("false".to_string()),
+        )? == "true"
+        {
             match context.fsimpl.create_dir_all(&target_path) {
                 Ok(()) => (),
                 Err(error) => {
@@ -660,6 +670,7 @@ fn get_conf_key(
     >,
     section: &str,
     key: &str,
+    default: Option<String>,
 ) -> Result<String, String> {
     let section_hash = match config.get(section) {
         Some(main) => main,
@@ -668,7 +679,13 @@ fn get_conf_key(
 
     let value = match section_hash.get(key) {
         Some(value) => value.clone().unwrap(),
-        None => return Err(format!("No {} in {} section of config", key, section)),
+        None => {
+            if default.is_none() {
+                return Err(format!("No {} in {} section of config", key, section));
+            } else {
+                return Ok(default.unwrap());
+            }
+        }
     };
 
     Ok(value)
@@ -945,6 +962,175 @@ mod tests {
     }
 
     #[test]
+    fn if_target_root_does_not_exist_and_creation_allowed_then_create_it() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\ncan_create_target_root=true\n[sources]\n/A=./B\n[periods]",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2
+            .expect_write()
+            .times(1)
+            .return_once(move |_, _| Ok(()));
+        mock.expect_clone().times(1).return_once(move || mock2);
+        mock.expect_read_to_string().times(1).return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists().times(2).returning(|path| {
+            if path == Path::new("/a") {
+                false
+            } else {
+                true
+            }
+        });
+        mock.expect_create_dir_all()
+            .times(1)
+            .return_once(|_| Ok(()));
+        mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
+        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
+
+        let result = body(mock, settings).unwrap();
+        assert_eq!(result, ());
+    }
+
+    #[test]
+    fn if_target_root_does_not_exist_and_creation_forbidden_then_error() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\ncan_create_target_root=false\n[sources]\n/A=./B\n[periods]",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2
+            .expect_write()
+            .times(1)
+            .return_once(move |_, _| Ok(()));
+        mock.expect_clone().times(1).return_once(move || mock2);
+        mock.expect_read_to_string().times(1).return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists().times(1).returning(|path| {
+            if path == Path::new("/a") {
+                false
+            } else {
+                true
+            }
+        });
+        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
+
+        let error = body(mock, settings).unwrap_err();
+        let exp_error = format!("Target root {:?} does not exist", Path::new("/a"));
+        assert_eq!(error, exp_error);
+    }
+
+    #[test]
+    fn if_target_root_does_not_exist_and_creation_not_specified_then_error() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\n[sources]\n/A=./B\n[periods]",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2
+            .expect_write()
+            .times(1)
+            .return_once(move |_, _| Ok(()));
+        mock.expect_clone().times(1).return_once(move || mock2);
+        mock.expect_read_to_string().times(1).return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists().times(1).returning(|path| {
+            if path == Path::new("/a") {
+                false
+            } else {
+                true
+            }
+        });
+        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
+
+        let error = body(mock, settings).unwrap_err();
+        let exp_error = format!("Target root {:?} does not exist", Path::new("/a"));
+        assert_eq!(error, exp_error);
+    }
+
+    #[test]
+    fn if_target_root_cannot_be_created_then_error() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\ncan_create_target_root=true\n[sources]\n/A=./B\n[periods]",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2
+            .expect_write()
+            .times(1)
+            .return_once(move |_, _| Ok(()));
+        mock.expect_clone().times(1).return_once(move || mock2);
+        mock.expect_read_to_string().times(1).return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists().times(1).returning(|path| {
+            if path == Path::new("/a") {
+                false
+            } else {
+                true
+            }
+        });
+        mock.expect_create_dir_all()
+            .times(1)
+            .return_once(|_| Err(std::io::Error::new(std::io::ErrorKind::Other, "error")));
+        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
+
+        let error = body(mock, settings).unwrap_err();
+        let exp_error = format!(
+            "Could not create target root dir {:?}: Custom {{ kind: Other, error: \"error\" }}",
+            Path::new("/a")
+        );
+        assert_eq!(error, exp_error);
+    }
+
+    #[test]
     fn rsync_multiple_sources() {
         let mut ini = Ini::new_cs();
         let config = ini
@@ -1209,11 +1395,11 @@ mod tests {
 
     #[test]
     fn if_period_too_short_then_error() {
-        let (settings, mock) = arrange_periods_test("a=1@1s");
+        let (settings, mock) = arrange_periods_test("a=1@59m");
         let error = body(mock, settings).map_err(|e| e);
         assert_eq!(
             error,
-            Err(String::from("Interval should be 1h-5y for a: 1@1s"))
+            Err(String::from("Interval should be 1h-5y for a: 1@59m"))
         );
     }
 
@@ -2314,11 +2500,11 @@ mod tests {
             fsimpl: Box::new(mock),
         };
 
-        let error = rotate_periods(settings, target_root, &context).map_err(|e| e);
-        let exp_error = Err(format!(
+        let error = rotate_periods(settings, target_root, &context).unwrap_err();
+        let exp_error = format!(
             "Could not remove {:?}: Custom {{ kind: Other, error: \"error\" }}",
             Path::new(".").join("daily.1")
-        ));
+        );
         assert_eq!(error, exp_error);
     }
 }
