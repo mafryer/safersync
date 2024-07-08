@@ -29,6 +29,7 @@ trait FsTraits: Send {
     fn mtime(&self, path: &Path) -> std::io::Result<FileTime>;
     fn write(&self, path: &Path, data: &str) -> std::io::Result<()>;
     fn rsync(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
+    fn touch(&self, path: &Path) -> std::io::Result<()>;
     fn cp_al(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
     fn mv(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
     fn path_exists(&self, path: &Path) -> bool;
@@ -75,26 +76,16 @@ impl FsTraits for FsImpl {
         }
 
         let command = format!(
-            "/usr/bin/rsync -a --delete --numeric-ids --relative --delete-excluded {:?} {:?}",
+            "/usr/bin/rsync -v -a --delete --numeric-ids --relative --delete-excluded {:?} {:?}",
             source, dest
         );
 
-        println!("Executing {}", command);
+        self.exec_command(&command, "rsync")
+    }
 
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output()
-            .expect("failed to execute process");
-        std::io::stdout().write_all(&output.stdout).unwrap();
-        std::io::stderr().write_all(&output.stderr).unwrap();
-        if !output.status.success() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "rsync failed",
-            ));
-        }
-        Ok(())
+    fn touch(&self, path: &Path) -> std::io::Result<()> {
+        let command = format!("touch {}", path.to_str().unwrap());
+        self.exec_command(&command, "touch")
     }
 
     fn path_exists(&self, path: &Path) -> bool {
@@ -125,23 +116,11 @@ impl FsTraits for FsImpl {
 
     fn cp_al(&self, source: &Path, dest: &Path) -> std::io::Result<()> {
         let command = format!(
-            "/usr/bin/cp -al {} {}",
+            "cp -al {} {}",
             source.to_str().unwrap(),
             dest.to_str().unwrap()
         );
-        println!("Executing {}", command);
-
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output()
-            .expect("failed to execute process");
-        std::io::stdout().write_all(&output.stdout).unwrap();
-        std::io::stderr().write_all(&output.stderr).unwrap();
-        if !output.status.success() {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "cp failed"));
-        }
-        Ok(())
+        self.exec_command(&command, "cp")
     }
 
     fn mv(&self, source: &Path, dest: &Path) -> std::io::Result<()> {
@@ -152,6 +131,27 @@ impl FsTraits for FsImpl {
     fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
         println!("Executing rm -rf {:?}", path);
         fs::remove_dir_all(path)
+    }
+}
+
+impl FsImpl {
+    fn exec_command(&self, command: &str, verb: &str) -> std::io::Result<()> {
+        println!("Executing {}", command);
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output()
+            .expect("failed to execute process");
+        std::io::stdout().write_all(&output.stdout).unwrap();
+        std::io::stderr().write_all(&output.stderr).unwrap();
+        if !output.status.success() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("{} failed", verb),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -190,6 +190,32 @@ impl PartialEq for PeriodInfo {
 }
 
 impl Eq for PeriodInfo {}
+
+struct SourceInfo {
+    path: String,
+    order: u32,
+}
+
+impl Ord for SourceInfo {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order.cmp(&other.order)
+    }
+}
+
+#[mutants::skip]
+impl PartialOrd for SourceInfo {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for SourceInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.order == other.order
+    }
+}
+
+impl Eq for SourceInfo {}
 
 #[mutants::skip]
 fn main() -> Result<(), String> {
@@ -543,47 +569,64 @@ fn rsync_sources(
         Some(main) => main,
         None => return Err(String::from("No sources section in config")),
     };
-    for (source, dest) in sources {
-        match dest {
-            Some(_) => (),
-            None => return Err(format!("No destination for source {:?}", source)),
-        }
 
-        println!("SOURCE {:?} DEST {:?}", source, dest.clone().unwrap());
+    let mut sources_set: SortedSet<SourceInfo> = SortedSet::new();
+    for (source_order, path_option) in sources {
+        let path = match path_option {
+            Some(path) => path,
+            None => return Err(format!("No path for source {:?}", source_order)),
+        };
 
-        let dest_path = Path::new(&target_root)
-            .join(".sync")
-            .join(dest.clone().unwrap());
+        let order = match source_order.parse::<u32>() {
+            Ok(count) => count,
+            Err(_) => {
+                return Err(format!(
+                    "Could not parse order for {}={}",
+                    source_order, path
+                ))
+            }
+        };
 
-        if !context
-            .fsimpl
-            .path_exists(Path::new(&target_root).join(".sync").as_path())
-        {
-            match context
-                .fsimpl
-                .create_dir_all(Path::new(&target_root).join(".sync").as_path())
-            {
+        sources_set.push(SourceInfo {
+            path: path.to_string(),
+            order: order,
+        });
+    }
+
+    let sync_pathbuf = Path::new(&target_root).join(".sync");
+    let sync_path = sync_pathbuf.as_path();
+
+    for source in sources_set.iter() {
+        println!("SOURCE {:?}", source.path);
+
+        if !context.fsimpl.path_exists(sync_path) {
+            match context.fsimpl.create_dir_all(sync_path) {
                 Ok(()) => (),
                 Err(error) => {
                     return Err(format!(
                         "Could not create .sync dir {:?}: {:?}",
-                        Path::new(&target_root).join(".sync"),
-                        error
+                        sync_path, error
                     ));
                 }
             }
         }
 
-        match context.fsimpl.rsync(Path::new(source), dest_path.as_path()) {
+        match context.fsimpl.rsync(Path::new(&source.path), sync_path) {
             Ok(_) => (),
             Err(error) => {
                 return Err(format!(
                     "Could not rsync {} to {:?}: {:?}",
-                    source, dest_path, error
+                    source.path, sync_path, error
                 ))
             }
         }
     }
+
+    match context.fsimpl.touch(sync_path) {
+        Ok(_) => (),
+        Err(error) => return Err(format!("Could not touch {:?}: {:?}", sync_path, error)),
+    }
+
     Ok(())
 }
 
@@ -787,6 +830,7 @@ mod tests {
             fn mtime(&self, path: &Path) -> std::io::Result<FileTime>;
             fn write(&self, path: &Path, data: &str) -> std::io::Result<()>;
             fn rsync(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
+            fn touch(&self, path: &Path) -> std::io::Result<()>;
             fn path_exists(&self, path: &Path) -> bool;
             fn is_dir(&self, path: &Path) -> Result<bool, String>;
             fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
@@ -825,6 +869,7 @@ mod tests {
         });
         mock.expect_path_exists().times(1).return_once(|_| true);
         mock.expect_is_dir().times(1).return_once(|_| Ok(true));
+        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
         let result = body(mock, settings).unwrap();
@@ -883,6 +928,7 @@ mod tests {
         mock.expect_clone().times(1).return_once(move || mock2);
         mock.expect_path_exists().times(1).return_once(|_| true);
         mock.expect_is_dir().times(1).return_once(|_| Ok(true));
+        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
         let result = body(mock, settings).unwrap();
@@ -946,6 +992,7 @@ mod tests {
         });
         mock.expect_path_exists().times(1).return_once(|_| true);
         mock.expect_is_dir().times(1).return_once(|_| Ok(true));
+        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
         let result = body(mock, settings).unwrap();
@@ -953,11 +1000,11 @@ mod tests {
     }
 
     #[test]
-    fn if_rsync_source_has_no_dest_then_should_fail() {
+    fn if_rsync_source_has_no_source_then_should_fail() {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n/A",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n1",
             ))
             .unwrap();
         let settings = Settings {
@@ -983,7 +1030,7 @@ mod tests {
         mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
         let error = body(mock, settings).map_err(|e| e);
-        assert_eq!(error, Err(String::from("No destination for source \"/A\"")));
+        assert_eq!(error, Err(String::from("No path for source \"1\"")));
     }
 
     #[test]
@@ -991,7 +1038,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\ncan_create_target_root=true\n[sources]\n/A=./B\n[periods]",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\ncan_create_target_root=true\n[sources]\n1=/A\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -1023,6 +1070,7 @@ mod tests {
             .times(1)
             .return_once(|_| Ok(()));
         mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
+        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
         let result = body(mock, settings).unwrap();
@@ -1034,7 +1082,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\ncan_create_target_root=false\n[sources]\n/A=./B\n[periods]",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\ncan_create_target_root=false\n[sources]\n1=/A\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -1074,7 +1122,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\n[sources]\n/A=./B\n[periods]",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\n[sources]\n1=/A\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -1114,7 +1162,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\ncan_create_target_root=true\n[sources]\n/A=./B\n[periods]",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=/a\ncan_create_target_root=true\n[sources]\n1=/A\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -1160,7 +1208,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n/A=./B\n/C=./D\n[periods]",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n1=/A\n2=/C\n[periods]",
             ))
             .unwrap();
         let settings = Settings {
@@ -1184,6 +1232,7 @@ mod tests {
         mock.expect_path_exists().times(3).return_const(true);
         mock.expect_is_dir().times(1).return_once(|_| Ok(true));
         mock.expect_rsync().times(2).returning(move |_, _| Ok(()));
+        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
         let result = body(mock, settings).unwrap();
@@ -1195,7 +1244,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n/A=./B\n/C=./D",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n1=/A\n2=/C",
             ))
             .unwrap();
         let settings = Settings {
@@ -1227,18 +1276,59 @@ mod tests {
         mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
         let error = body(mock, settings).map_err(|e| e);
-        let exp1 = Err(format!(
-            "Could not rsync /A to {:?}: Custom {{ kind: Other, error: \"rsync failed\" }}",
-            Path::new(".sync").join("./B")
-        ));
-        let exp2 = Err(format!(
-            "Could not rsync /C to {:?}: Custom {{ kind: Other, error: \"rsync failed\" }}",
-            Path::new(".sync").join("./D")
-        ));
-        println!("ERROR {:?}", error);
-        println!("EXP 1 {:?}", exp1);
-        println!("EXP 2 {:?}", exp2);
-        assert!(error == exp1 || error == exp2);
+        assert_eq!(
+            error,
+            Err(format!(
+                "Could not rsync /A to {:?}: Custom {{ kind: Other, error: \"rsync failed\" }}",
+                ".sync"
+            ))
+        );
+    }
+
+    #[test]
+    fn if_multiple_sources_then_obey_source_order() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n10=/A\n9=/C",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2
+            .expect_write()
+            .times(1)
+            .return_once(move |_, _| Ok(()));
+        mock.expect_clone().times(1).return_once(move || mock2);
+        mock.expect_read_to_string().times(1).return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists().times(2).return_const(true);
+        mock.expect_is_dir().times(1).return_once(|_| Ok(true));
+        mock.expect_rsync().times(1).return_once(move |_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "rsync failed",
+            ))
+        });
+        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
+
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(format!(
+                "Could not rsync /C to {:?}: Custom {{ kind: Other, error: \"rsync failed\" }}",
+                ".sync"
+            ))
+        );
     }
 
     fn arrange_periods_test(periods: &str) -> (Settings, MockFsImpl) {
@@ -1249,8 +1339,8 @@ mod tests {
                 pid_file=/var/run/safersync.pid
                 target_root=
                 [sources]
-                /A=./B
-                /C=./D
+                1=/A
+                2=/C
                 [periods]
                 {}",
                 periods
@@ -1277,6 +1367,7 @@ mod tests {
         mock.expect_path_exists().times(3).return_const(true);
         mock.expect_is_dir().times(1).return_once(|_| Ok(true));
         mock.expect_rsync().times(2).returning(move |_, _| Ok(()));
+        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
         (settings, mock)
@@ -1291,8 +1382,8 @@ mod tests {
                 pid_file=/var/run/safersync.pid
                 target_root=
                 [sources]
-                /A=./B
-                /C=./D
+                1=/A
+                2=/C
                 [periods]
                 a=1@1h",
             )))
@@ -1314,8 +1405,8 @@ mod tests {
                 pid_file=/var/run/safersync.pid
                 target_root=
                 [sources]
-                /A=./B
-                /C=./D
+                1=/A
+                2=/C
                 [periods]
                 a=1@5y",
             )))
@@ -1443,7 +1534,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n1=/A\n[periods]\nhourly=1@1h",
             ))
             .unwrap();
         let settings = Settings {
@@ -1477,6 +1568,7 @@ mod tests {
             });
         mock.expect_is_dir().times(1).return_once(|_| Ok(true));
         mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
+        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_cp_al().times(1).return_once(|_, _| Ok(()));
         mock.expect_mv()
             .times(1)
@@ -1496,7 +1588,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n1=/A\n[periods]\nhourly=1@1h",
             ))
             .unwrap();
         let settings = Settings {
@@ -1528,6 +1620,7 @@ mod tests {
         });
         mock.expect_is_dir().times(1).return_once(|_| Ok(true));
         mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
+        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_cp_al().times(1).return_once(|_, _| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -1552,7 +1645,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n1=/A\n[periods]\nhourly=1@1h",
             ))
             .unwrap();
         let settings = Settings {
@@ -1579,6 +1672,7 @@ mod tests {
             .return_once(move |_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
         mock.expect_is_dir().times(1).return_once(|_| Ok(true));
         mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
+        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
         let result = body(mock, settings).unwrap();
@@ -1794,7 +1888,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n1=/A\n[periods]\nhourly=1@1h",
             ))
             .unwrap();
         let settings = Settings {
@@ -1840,7 +1934,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n/A=./B\n[periods]\nhourly=1@1h",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=tr\n[sources]\n1=/A\n[periods]\nhourly=1@1h",
             ))
             .unwrap();
         let settings = Settings {
@@ -1886,7 +1980,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=1@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -1922,7 +2016,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=1@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -1969,7 +2063,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=1@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -2022,7 +2116,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=1@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -2071,7 +2165,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=1@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -2130,7 +2224,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=1@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -2196,7 +2290,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=1@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=1@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -2258,7 +2352,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=2@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=2@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -2314,7 +2408,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=2@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=2@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -2377,7 +2471,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=2@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=2@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -2437,7 +2531,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=3@1h\ndaily=2@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=3@1h\ndaily=2@1d",
             ))
             .unwrap();
         let settings = Settings {
@@ -2484,7 +2578,7 @@ mod tests {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(
-                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n/A=./B\n[periods]\nhourly=2@1h\ndaily=2@1d",
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=.\n[sources]\n1=/A\n[periods]\nhourly=2@1h\ndaily=2@1d",
             ))
             .unwrap();
         let settings = Settings {
