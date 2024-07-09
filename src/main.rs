@@ -37,6 +37,7 @@ trait FsTraits: Send {
     fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
     fn remove_dir_all(&self, path: &Path) -> std::io::Result<()>;
+    fn sleep(&self, duration: Duration);
 }
 
 #[derive(Clone)]
@@ -131,6 +132,10 @@ impl FsTraits for FsImpl {
     fn remove_dir_all(&self, path: &Path) -> std::io::Result<()> {
         println!("Executing rm -rf {:?}", path);
         fs::remove_dir_all(path)
+    }
+
+    fn sleep(&self, duration: Duration) {
+        thread::sleep(duration);
     }
 }
 
@@ -261,20 +266,33 @@ fn body(fsimpl: impl FsTraits + Clone + 'static, settings: Settings) -> Result<(
         }
     }
 
+    match context
+        .fsimpl
+        .write(Path::new(&pid_path), &format!("{}", std::process::id()))
+    {
+        Ok(()) => (),
+        Err(error) => {
+            return Err(format!(
+                "Could not write PID file {:?}: {:?}",
+                pid_path, error
+            ))
+        }
+    }
+
     let (stop_pid_thread_tx, stop_pid_thread_rx) = mpsc::channel();
 
-    let pid_thread = move |path: String| {
-        fsimpl_pid_thread
-            .write(Path::new(&path), &format!("{}", std::process::id()))
-            .unwrap();
+    let pid_thread = move |path: String| loop {
         for _ in 1..600 {
-            thread::sleep(Duration::from_millis(100));
+            fsimpl_pid_thread.sleep(Duration::from_millis(100));
             let received = stop_pid_thread_rx.try_recv();
             match received {
                 Ok(_) => return,
                 Err(_) => (),
             }
         }
+        fsimpl_pid_thread
+            .write(Path::new(&path), &format!("{}", std::process::id()))
+            .unwrap();
     };
 
     let pid_thread_pid_path = pid_path.clone();
@@ -318,7 +336,7 @@ fn rotate_periods(
 ) -> Result<(), String> {
     let periods_set = match parse_periods(settings) {
         Ok(value) => value,
-        Err(value) => return value,
+        Err(value) => return Err(value),
     };
 
     let mut optional_last_period: Option<PeriodInfo> = None;
@@ -581,7 +599,7 @@ fn rsync_sources(
             Ok(count) => count,
             Err(_) => {
                 return Err(format!(
-                    "Could not parse order for {}={}",
+                    "Could not parse order for source: {}={}",
                     source_order, path
                 ))
             }
@@ -663,51 +681,51 @@ fn ensure_target_root_exists(
     })
 }
 
-fn parse_periods(settings: Settings) -> Result<SortedSet<PeriodInfo>, Result<(), String>> {
+fn parse_periods(settings: Settings) -> Result<SortedSet<PeriodInfo>, String> {
     let periods = match settings.config.get("periods") {
         Some(main) => main,
-        None => return Err(Err(String::from("No periods section in config"))),
+        None => return Err(String::from("No periods section in config")),
     };
     let mut periods_set = SortedSet::new();
     for (period_name, details) in periods {
         if period_name.len() == 0 {
-            return Err(Err(String::from("An empty period name was found")));
+            return Err(String::from("An empty period name was found"));
         }
         if filenamify(&period_name).ne(period_name) {
-            return Err(Err(format!("Invalid period name: {}", period_name)));
+            return Err(format!("Invalid period name: {}", period_name));
         }
 
         let details_str = details.clone().unwrap_or("".to_string());
         let parts = details_str.split("@").collect::<Vec<&str>>();
         if parts.len() != 2 {
-            return Err(Err(format!(
+            return Err(format!(
                 "Invalid period details (should be <count>@<interval>) for {}: {}",
                 period_name, details_str
-            )));
+            ));
         }
         let count = match parts[0].parse::<u32>() {
             Ok(count) => count,
             Err(_) => {
-                return Err(Err(format!(
+                return Err(format!(
                     "Could not parse count (should be 1-100) for {}: {}",
                     period_name, details_str
-                )))
+                ))
             }
         };
         if count < 1 || count > 100 {
-            return Err(Err(format!(
+            return Err(format!(
                 "Count should be 1-100 for {}: {}",
                 period_name, details_str
-            )));
+            ));
         }
         let duration = DurationString::from_string(parts[1].to_string());
         let interval: Duration = match duration {
             Ok(duration) => duration.into(),
             Err(_) => {
-                return Err(Err(format!(
+                return Err(format!(
                     "Could not parse interval (should be 1s-1y) for {}: {}",
                     period_name, details_str
-                )))
+                ))
             }
         };
         if interval < Duration::from_secs(60 * 60)
@@ -716,10 +734,10 @@ fn parse_periods(settings: Settings) -> Result<SortedSet<PeriodInfo>, Result<(),
                     .unwrap()
                     .into()
         {
-            return Err(Err(format!(
+            return Err(format!(
                 "Interval should be 1h-5y for {}: {}",
                 period_name, details_str
-            )));
+            ));
         }
 
         periods_set.push(PeriodInfo {
@@ -774,7 +792,7 @@ fn get_other_pid(context: &Context, pid_path: &Path) -> Result<Option<String>, S
         }
         Err(error) => {
             return Err(format!(
-                "Could not read {:?}: {:?} {:?}",
+                "Could not read PID file {:?}: {:?} {:?}",
                 pid_path,
                 error.kind(),
                 error.to_string()
@@ -820,7 +838,10 @@ mod tests {
 
     use super::*;
     use mockall::*;
-    use std::ops::Sub;
+    use std::{
+        ops::Sub,
+        sync::{Arc, Mutex},
+    };
 
     mock! {
         pub FsImpl {
@@ -838,6 +859,7 @@ mod tests {
             fn cp_al(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
             fn mv(&self, source: &Path, dest: &Path) -> std::io::Result<()>;
             fn remove_dir_all(&self, path: &Path) -> std::io::Result<()>;
+            fn sleep(&self, duration: Duration);
         }
         impl Clone for FsImpl {
             fn clone(&self) -> Self;
@@ -857,9 +879,14 @@ mod tests {
             ignore_others: false,
         };
 
+        let (sleep_signal_tx, sleep_signal_rx) = mpsc::channel();
+        let sleep_signal_rx = Arc::new(Mutex::new(sleep_signal_rx));
         let mut mock = MockFsImpl::new();
         let mut mock2 = MockFsImpl::new();
-        mock2.expect_write().times(1).return_once(|_, _| Ok(()));
+        mock2.expect_sleep().times(1).return_once(move |_| {
+            let _ = sleep_signal_rx.lock().unwrap().try_recv();
+        });
+        mock.expect_write().times(1).return_once(|_, _| Ok(()));
         mock.expect_clone().times(1).return_once(move || mock2);
         mock.expect_read_to_string().times(1).return_once(move |_| {
             Err(std::io::Error::new(
@@ -874,6 +901,7 @@ mod tests {
 
         let result = body(mock, settings).unwrap();
         assert_eq!(result, ());
+        let _ = sleep_signal_tx.send("wake-up");
     }
 
     #[test]
@@ -901,9 +929,100 @@ mod tests {
         assert_eq!(
             error,
             Err(String::from(
-                "Could not read \"/var/run/safersync.pid\": ConnectionReset \"Connection Reset\""
+                "Could not read PID file \"/var/run/safersync.pid\": ConnectionReset \"Connection Reset\""
             ))
         );
+    }
+
+    #[test]
+    fn if_pid_file_write_error_then_should_exit() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from("[main]\npid_file=/var/run/safersync.pid"))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mut mock = MockFsImpl::new();
+        let mock2 = MockFsImpl::new();
+        mock.expect_write().times(1).return_once(|_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Permission Denied",
+            ))
+        });
+        mock.expect_clone().times(1).return_once(move || mock2);
+        mock.expect_read_to_string().times(1).return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+
+        let error = body(mock, settings).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(String::from(
+                "Could not write PID file \"/var/run/safersync.pid\": Custom { kind: PermissionDenied, error: \"Permission Denied\" }"
+            ))
+        );
+    }
+
+    #[test]
+    fn if_running_then_should_keep_writing_pid_file() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\n[periods]",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let (write_signal_tx, write_signal_rx) = mpsc::channel();
+        let write_signal_rx = Arc::new(Mutex::new(write_signal_rx));
+        let write_signal_rx2 = write_signal_rx.clone();
+        let write_signal_rx3 = write_signal_rx.clone();
+        let write_signal_tx = Arc::new(Mutex::new(write_signal_tx));
+        let write_signal_tx2 = write_signal_tx.clone();
+        let mut mock = MockFsImpl::new();
+        let mut mock2 = MockFsImpl::new();
+        mock2.expect_sleep().returning(|_| {});
+        mock2.expect_write().times(2).returning(move |_, _| {
+            let _ = write_signal_tx.lock().unwrap().send("written");
+            Ok(())
+        });
+        mock.expect_write().times(1).return_once(move |_, _| {
+            let _ = write_signal_tx2.lock().unwrap().send("written");
+            Ok(())
+        });
+        mock.expect_clone().times(1).return_once(move || mock2);
+        mock.expect_read_to_string().times(1).return_once(move |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "File Not Found",
+            ))
+        });
+        mock.expect_path_exists().times(1).return_once(move |_| {
+            let _ = write_signal_rx.lock().unwrap().recv().unwrap();
+            true
+        });
+        mock.expect_is_dir().times(1).return_once(move |_| {
+            let _ = write_signal_rx2.lock().unwrap().recv().unwrap();
+            Ok(true)
+        });
+        mock.expect_touch().times(1).return_once(move |_| {
+            let _ = write_signal_rx3.lock().unwrap().recv().unwrap();
+            Ok(())
+        });
+        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
+
+        let result = body(mock, settings).unwrap();
+        assert_eq!(result, ());
     }
 
     #[test]
@@ -919,12 +1038,14 @@ mod tests {
             ignore_others: true,
         };
 
+        let (sleep_signal_tx, sleep_signal_rx) = mpsc::channel();
+        let sleep_signal_rx = Arc::new(Mutex::new(sleep_signal_rx));
         let mut mock = MockFsImpl::new();
         let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
+        mock2.expect_sleep().times(1).return_once(move |_| {
+            let _ = sleep_signal_rx.lock().unwrap().try_recv();
+        });
+        mock.expect_write().times(1).return_once(move |_, _| Ok(()));
         mock.expect_clone().times(1).return_once(move || mock2);
         mock.expect_path_exists().times(1).return_once(|_| true);
         mock.expect_is_dir().times(1).return_once(|_| Ok(true));
@@ -933,6 +1054,7 @@ mod tests {
 
         let result = body(mock, settings).unwrap();
         assert_eq!(result, ());
+        let _ = sleep_signal_tx.send("wake-up");
     }
 
     #[test]
@@ -975,12 +1097,14 @@ mod tests {
             ignore_others: false,
         };
 
+        let (sleep_signal_tx, sleep_signal_rx) = mpsc::channel();
+        let sleep_signal_rx = Arc::new(Mutex::new(sleep_signal_rx));
         let mut mock = MockFsImpl::new();
         let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
+        mock2.expect_sleep().times(1).return_once(move |_| {
+            let _ = sleep_signal_rx.lock().unwrap().try_recv();
+        });
+        mock.expect_write().times(1).return_once(move |_, _| Ok(()));
         mock.expect_clone().times(1).return_once(move || mock2);
         mock.expect_read_to_string()
             .times(1)
@@ -997,6 +1121,7 @@ mod tests {
 
         let result = body(mock, settings).unwrap();
         assert_eq!(result, ());
+        let _ = sleep_signal_tx.send("wake-up");
     }
 
     #[test]
@@ -1012,25 +1137,40 @@ mod tests {
             ignore_others: false,
         };
 
-        let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(1).return_once(|_| true);
-        mock.expect_is_dir().times(1).return_once(|_| Ok(true));
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
+        let mock = MockFsImpl::new();
+        let target_root = String::from("");
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
 
-        let error = body(mock, settings).map_err(|e| e);
+        let error = rsync_sources(&settings, &target_root, &context).map_err(|e| e);
         assert_eq!(error, Err(String::from("No path for source \"1\"")));
+    }
+
+    #[test]
+    fn if_rsync_source_has_something_other_than_a_number_then_should_fail() {
+        let mut ini = Ini::new_cs();
+        let config = ini
+            .read(String::from(
+                "[main]\npid_file=/var/run/safersync.pid\ntarget_root=\n[sources]\nA=B",
+            ))
+            .unwrap();
+        let settings = Settings {
+            config: config,
+            ignore_others: false,
+        };
+
+        let mock = MockFsImpl::new();
+        let target_root = String::from("");
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = rsync_sources(&settings, &target_root, &context).map_err(|e| e);
+        assert_eq!(
+            error,
+            Err(String::from("Could not parse order for source: A=B"))
+        );
     }
 
     #[test]
@@ -1047,33 +1187,17 @@ mod tests {
         };
 
         let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(2).returning(|path| {
-            if path == Path::new("/a") {
-                false
-            } else {
-                true
-            }
-        });
+        mock.expect_path_exists().times(1).returning(|_| false);
         mock.expect_create_dir_all()
             .times(1)
             .return_once(|_| Ok(()));
-        mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
-        mock.expect_touch().times(1).return_once(|_| Ok(()));
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
-        let result = body(mock, settings).unwrap();
+        let target_root = String::from("/a");
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = ensure_target_root_exists(&target_root, &context, &settings).unwrap();
         assert_eq!(result, ());
     }
 
@@ -1091,28 +1215,14 @@ mod tests {
         };
 
         let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(1).returning(|path| {
-            if path == Path::new("/a") {
-                false
-            } else {
-                true
-            }
-        });
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
+        mock.expect_path_exists().times(1).returning(|_| false);
 
-        let error = body(mock, settings).unwrap_err();
+        let target_root = String::from("/a");
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = ensure_target_root_exists(&target_root, &context, &settings).unwrap_err();
         let exp_error = format!("Target root {:?} does not exist", Path::new("/a"));
         assert_eq!(error, exp_error);
     }
@@ -1131,28 +1241,14 @@ mod tests {
         };
 
         let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(1).returning(|path| {
-            if path == Path::new("/a") {
-                false
-            } else {
-                true
-            }
-        });
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
+        mock.expect_path_exists().times(1).returning(|_| false);
 
-        let error = body(mock, settings).unwrap_err();
+        let target_root = String::from("/a");
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = ensure_target_root_exists(&target_root, &context, &settings).unwrap_err();
         let exp_error = format!("Target root {:?} does not exist", Path::new("/a"));
         assert_eq!(error, exp_error);
     }
@@ -1171,31 +1267,17 @@ mod tests {
         };
 
         let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(1).returning(|path| {
-            if path == Path::new("/a") {
-                false
-            } else {
-                true
-            }
-        });
+        mock.expect_path_exists().times(1).returning(|_| false);
         mock.expect_create_dir_all()
             .times(1)
             .return_once(|_| Err(std::io::Error::new(std::io::ErrorKind::Other, "error")));
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
-        let error = body(mock, settings).unwrap_err();
+        let target_root = String::from("/a");
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = ensure_target_root_exists(&target_root, &context, &settings).unwrap_err();
         let exp_error = format!(
             "Could not create target root dir {:?}: Custom {{ kind: Other, error: \"error\" }}",
             Path::new("/a")
@@ -1216,12 +1298,14 @@ mod tests {
             ignore_others: false,
         };
 
+        let (sleep_signal_tx, sleep_signal_rx) = mpsc::channel();
+        let sleep_signal_rx = Arc::new(Mutex::new(sleep_signal_rx));
         let mut mock = MockFsImpl::new();
         let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
+        mock2.expect_sleep().times(1).return_once(move |_| {
+            let _ = sleep_signal_rx.lock().unwrap().try_recv();
+        });
+        mock.expect_write().times(1).return_once(move |_, _| Ok(()));
         mock.expect_clone().times(1).return_once(move || mock2);
         mock.expect_read_to_string().times(1).return_once(move |_| {
             Err(std::io::Error::new(
@@ -1237,6 +1321,7 @@ mod tests {
 
         let result = body(mock, settings).unwrap();
         assert_eq!(result, ());
+        let _ = sleep_signal_tx.send("wake-up");
     }
 
     #[test]
@@ -1253,29 +1338,20 @@ mod tests {
         };
 
         let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(2).return_const(true);
-        mock.expect_is_dir().times(1).return_once(|_| Ok(true));
+        mock.expect_path_exists().times(1).return_const(true);
         mock.expect_rsync().times(1).return_once(move |_, _| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "rsync failed",
             ))
         });
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
-        let error = body(mock, settings).map_err(|e| e);
+        let target_root = String::from("");
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = rsync_sources(&settings, &target_root, &context).map_err(|e| e);
         assert_eq!(
             error,
             Err(format!(
@@ -1299,29 +1375,20 @@ mod tests {
         };
 
         let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(2).return_const(true);
-        mock.expect_is_dir().times(1).return_once(|_| Ok(true));
+        mock.expect_path_exists().times(1).return_const(true);
         mock.expect_rsync().times(1).return_once(move |_, _| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::Other,
                 "rsync failed",
             ))
         });
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
-        let error = body(mock, settings).map_err(|e| e);
+        let target_root = String::from("");
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = rsync_sources(&settings, &target_root, &context).map_err(|e| e);
         assert_eq!(
             error,
             Err(format!(
@@ -1331,7 +1398,7 @@ mod tests {
         );
     }
 
-    fn arrange_periods_test(periods: &str) -> (Settings, MockFsImpl) {
+    fn arrange_periods_test(periods: &str) -> Settings {
         let mut ini = Ini::new_cs();
         let config = ini
             .read(String::from(format!(
@@ -1346,31 +1413,10 @@ mod tests {
                 periods
             )))
             .unwrap();
-        let settings = Settings {
+        Settings {
             config: config,
             ignore_others: false,
-        };
-
-        let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(3).return_const(true);
-        mock.expect_is_dir().times(1).return_once(|_| Ok(true));
-        mock.expect_rsync().times(2).returning(move |_, _| Ok(()));
-        mock.expect_touch().times(1).return_once(|_| Ok(()));
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
-
-        (settings, mock)
+        }
     }
 
     #[test]
@@ -1448,15 +1494,15 @@ mod tests {
 
     #[test]
     fn if_invalid_period_name_then_error() {
-        let (settings, mock) = arrange_periods_test("/=1@1d");
-        let error = body(mock, settings).map_err(|e| e);
+        let settings = arrange_periods_test("/=1@1d");
+        let error = parse_periods(settings).map_err(|e| e);
         assert_eq!(error, Err(String::from("Invalid period name: /")));
     }
 
     #[test]
     fn if_invalid_period_details_format_then_error() {
-        let (settings, mock) = arrange_periods_test("a=1");
-        let error = body(mock, settings).map_err(|e| e);
+        let settings = arrange_periods_test("a=1");
+        let error = parse_periods(settings).map_err(|e| e);
         assert_eq!(
             error,
             Err(String::from(
@@ -1467,8 +1513,8 @@ mod tests {
 
     #[test]
     fn if_invalid_period_count_then_error() {
-        let (settings, mock) = arrange_periods_test("a=a@1h");
-        let error = body(mock, settings).map_err(|e| e);
+        let settings = arrange_periods_test("a=a@1h");
+        let error = parse_periods(settings).map_err(|e| e);
         assert_eq!(
             error,
             Err(String::from(
@@ -1479,8 +1525,8 @@ mod tests {
 
     #[test]
     fn if_period_count_too_few_then_error() {
-        let (settings, mock) = arrange_periods_test("a=0@1h");
-        let error = body(mock, settings).map_err(|e| e);
+        let settings = arrange_periods_test("a=0@1h");
+        let error = parse_periods(settings).map_err(|e| e);
         assert_eq!(
             error,
             Err(String::from("Count should be 1-100 for a: 0@1h"))
@@ -1489,8 +1535,8 @@ mod tests {
 
     #[test]
     fn if_period_count_too_many_then_error() {
-        let (settings, mock) = arrange_periods_test("a=101@1h");
-        let error = body(mock, settings).map_err(|e| e);
+        let settings = arrange_periods_test("a=101@1h");
+        let error = parse_periods(settings).map_err(|e| e);
         assert_eq!(
             error,
             Err(String::from("Count should be 1-100 for a: 101@1h"))
@@ -1499,8 +1545,8 @@ mod tests {
 
     #[test]
     fn if_invalid_period_length_then_error() {
-        let (settings, mock) = arrange_periods_test("a=1@xyz");
-        let error = body(mock, settings).map_err(|e| e);
+        let settings = arrange_periods_test("a=1@xyz");
+        let error = parse_periods(settings).map_err(|e| e);
         assert_eq!(
             error,
             Err(String::from(
@@ -1511,8 +1557,8 @@ mod tests {
 
     #[test]
     fn if_period_too_short_then_error() {
-        let (settings, mock) = arrange_periods_test("a=1@59m");
-        let error = body(mock, settings).map_err(|e| e);
+        let settings = arrange_periods_test("a=1@59m");
+        let error = parse_periods(settings).map_err(|e| e);
         assert_eq!(
             error,
             Err(String::from("Interval should be 1h-5y for a: 1@59m"))
@@ -1521,8 +1567,8 @@ mod tests {
 
     #[test]
     fn if_period_too_long_then_error() {
-        let (settings, mock) = arrange_periods_test("a=1@5y1d");
-        let error = body(mock, settings).map_err(|e| e);
+        let settings = arrange_periods_test("a=1@5y1d");
+        let error = parse_periods(settings).map_err(|e| e);
         assert_eq!(
             error,
             Err(String::from("Interval should be 1h-5y for a: 1@5y1d"))
@@ -1543,20 +1589,8 @@ mod tests {
         };
 
         let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
         mock.expect_path_exists()
-            .times(3 + 101 + 2)
+            .times(1 + 101 + 2)
             .returning(|path| {
                 if path == Path::new("tr") || path == Path::new("tr").join(".sync") {
                     true
@@ -1566,9 +1600,6 @@ mod tests {
                     false
                 }
             });
-        mock.expect_is_dir().times(1).return_once(|_| Ok(true));
-        mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
-        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_cp_al().times(1).return_once(|_, _| Ok(()));
         mock.expect_mv()
             .times(1)
@@ -1577,9 +1608,12 @@ mod tests {
                     && dest == Path::new("tr").join("hourly.0")
             })
             .return_once(|_, _| Ok(()));
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
-        let result = body(mock, settings).unwrap();
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, String::from("tr"), &context).unwrap();
         assert_eq!(result, ());
     }
 
@@ -1597,19 +1631,7 @@ mod tests {
         };
 
         let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(3 + 101).returning(|path| {
+        mock.expect_path_exists().times(1 + 101).returning(|path| {
             if path == Path::new("tr") || path == Path::new("tr").join(".sync") {
                 true
             } else if path == Path::new("tr").join("hourly.0") {
@@ -1618,18 +1640,18 @@ mod tests {
                 false
             }
         });
-        mock.expect_is_dir().times(1).return_once(|_| Ok(true));
-        mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
-        mock.expect_touch().times(1).return_once(|_| Ok(()));
         mock.expect_cp_al().times(1).return_once(|_, _| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "File Not Found",
             ))
         });
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
-        let error = body(mock, settings).map_err(|e| e);
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let error = rotate_periods(settings, "tr".to_string(), &context).map_err(|e| e);
         assert_eq!(
             error,
             Err(format!(
@@ -1654,28 +1676,16 @@ mod tests {
         };
 
         let mut mock = MockFsImpl::new();
-        let mut mock2 = MockFsImpl::new();
-        mock2
-            .expect_write()
-            .times(1)
-            .return_once(move |_, _| Ok(()));
-        mock.expect_clone().times(1).return_once(move || mock2);
-        mock.expect_read_to_string().times(1).return_once(move |_| {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "File Not Found",
-            ))
-        });
-        mock.expect_path_exists().times(3).return_const(true);
+        mock.expect_path_exists().times(1).return_const(true);
         mock.expect_mtime()
             .times(1)
             .return_once(move |_| Ok(FileTime::from_system_time(std::time::SystemTime::now())));
-        mock.expect_is_dir().times(1).return_once(|_| Ok(true));
-        mock.expect_rsync().times(1).returning(move |_, _| Ok(()));
-        mock.expect_touch().times(1).return_once(|_| Ok(()));
-        mock.expect_remove_file().times(1).return_once(|_| Ok(()));
 
-        let result = body(mock, settings).unwrap();
+        let context = Context {
+            fsimpl: Box::new(mock),
+        };
+
+        let result = rotate_periods(settings, "tr".to_string(), &context).unwrap();
         assert_eq!(result, ());
     }
 
